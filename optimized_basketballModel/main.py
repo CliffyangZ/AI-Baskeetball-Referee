@@ -19,8 +19,8 @@ def main():
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Basketball Tracking Demo')
-    parser.add_argument('--model', type=str, default='pt_models/basketballModel.pt', help='Path to the YOLO model')
-    parser.add_argument('--source', type=str, default='data/video/dribbling.mov', help='Path to the video file')
+    parser.add_argument('--model', type=str, default='../pt_models/basketballModel.pt', help='Path to the YOLO model')
+    parser.add_argument('--source', type=str, default='../data/video/dribbling.mov', help='Path to the video file')
     parser.add_argument('--enhanced', action='store_true', help='Use enhanced tracking with Kalman filtering')
     parser.add_argument('--scale', type=float, default=1.0, help='Display scale factor')
     args = parser.parse_args()

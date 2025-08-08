@@ -139,26 +139,32 @@ class BasketballTracker:
         self.performance_monitor.reset()
         
         try:
-            # Run tracking with ByteTrack
-            results = self.model.track(
+            # Use predict instead of track to avoid ByteTrack configuration issues
+            # Stream=True prevents RAM accumulation
+            results = self.model.predict(
                 source=video_path,
-                tracker=self.tracker_config,
-                conf=0.25,          # Detection confidence (lower to capture more candidates)
+                conf=0.25,          # Detection confidence threshold
                 iou=0.5,            # NMS IoU threshold
-                show=True,
-                save=True if output_path else False,
-                save_txt=True,      # Save tracking results
+                show=True,          # Display results
+                save=True if output_path else False,  # Save results if output path provided
+                save_txt=True,      # Save detection results
                 save_conf=True,     # Save confidence scores
-                verbose=False       # Reduce console output for better performance
+                verbose=False,      # Reduce console output for better performance
+                stream=True         # Stream results to prevent memory accumulation
             )
+            
+            # Process each frame
+            for r in results:
+                # You could do additional processing here if needed
+                pass
             
             # Generate performance report
             stats = self.performance_monitor.get_stats()
-            print(f"Tracking Performance: {stats}")
+            print(f"Detection Performance: {stats}")
             
-            return results
+            return None  # In streaming mode we don't accumulate results
         except Exception as e:
-            print(f"Error during video tracking: {e}")
+            print(f"Error during video processing: {e}")
             return None
     
     def track_realtime(self, source=0, display_scale=1.0):
