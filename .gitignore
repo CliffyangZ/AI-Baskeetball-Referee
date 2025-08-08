@@ -2,3 +2,4 @@ pt_models/
 data/
 runs/
 __pycache__
+.DS_Store
