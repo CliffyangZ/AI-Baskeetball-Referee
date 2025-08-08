@@ -6,6 +6,8 @@ from collections import deque
 import yaml
 import os
 
+from PerformanceMonitor import PerformanceMonitor
+
 class BasketballTracker:
     """
     Basketball tracking class that integrates YOLO detection with ByteTrack
@@ -34,7 +36,7 @@ class BasketballTracker:
         # Print model information
         if hasattr(self.model, 'names'):
             print(f"Model classes: {self.model.names}")
-        
+        """
         # Test the model on a simple image to verify it works
         try:
             # Create a test image (black background)
@@ -60,7 +62,7 @@ class BasketballTracker:
                 print("Model test: No results from test inference")
         except Exception as e:
             print(f"Model test failed: {e}")
-        
+        """
         # Create ByteTrack configuration file if it doesn't exist
         self.tracker_config = self._create_tracker_config()
         
