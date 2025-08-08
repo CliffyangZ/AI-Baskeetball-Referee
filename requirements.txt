@@ -1,8 +1,7 @@
 filterpy==1.4.5
 gTTS==2.5.4
-numpy==2.3.2
+numpy==2.2.6
 opencv_python==4.12.0.88
-playsound==1.3.0
 PyYAML==6.0.2
 PyYAML==6.0.2
 scipy==1.16.1
