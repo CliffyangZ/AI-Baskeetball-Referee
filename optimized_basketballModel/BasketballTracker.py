@@ -1,7 +1,6 @@
 from ultralytics import YOLO
 import cv2
 import numpy as np
-import time
 from collections import deque
 import yaml
 import os
@@ -24,45 +23,12 @@ class BasketballTracker:
             # Try to load the specified model
             self.model = YOLO(model_path)
             print(f"Loaded model: {model_path}")
-            model_type = "custom"
         except Exception as e:
             print(f"Warning: Could not load {model_path}: {e}")
             print("Falling back to YOLOv8n model...")
             # Fall back to a default model if the specified one doesn't exist
             self.model = YOLO('yolov8n.pt')
-            print(f"Using YOLOv8n model instead")
-            model_type = "default"
-        
-        # Print model information
-        if hasattr(self.model, 'names'):
-            print(f"Model classes: {self.model.names}")
-        """
-        # Test the model on a simple image to verify it works
-        try:
-            # Create a test image (black background)
-            test_img = np.zeros((640, 640, 3), dtype=np.uint8)
-            # Draw a white circle (simulating a ball)
-            cv2.circle(test_img, (320, 320), 50, (255, 255, 255), -1)
-            
-            # Run inference on test image
-            test_results = self.model(test_img, verbose=False)
-            if test_results and len(test_results) > 0 and hasattr(test_results[0], 'boxes'):
-                boxes = test_results[0].boxes
-                if len(boxes) > 0:
-                    print(f"Model test successful! Detected {len(boxes)} objects in test image")
-                    if hasattr(boxes, 'cls'):
-                        classes = boxes.cls.int().cpu().tolist()
-                        print(f"Detected classes: {classes}")
-                        if hasattr(self.model, 'names'):
-                            class_names = [self.model.names[int(c)] for c in classes]
-                            print(f"Class names: {class_names}")
-                else:
-                    print("Model test: No objects detected in test image")
-            else:
-                print("Model test: No results from test inference")
-        except Exception as e:
-            print(f"Model test failed: {e}")
-        """
+            print("Using YOLOv8n model instead")
         # Create ByteTrack configuration file if it doesn't exist
         self.tracker_config = self._create_tracker_config()
         
@@ -81,21 +47,10 @@ class BasketballTracker:
         # Store class indices for basketball (if available in the model)
         self.basketball_class_indices = []
         if hasattr(self.model, 'names'):
-            for idx, name in self.model.names.items():
-                # Look for any ball-like objects in the model's classes
-                if ('ball' in name.lower() or 
-                    'basketball' in name.lower() or 
-                    'sports ball' in name.lower()):
-                    self.basketball_class_indices.append(idx)
-                    print(f"Found ball class: {idx} - {name}")
-            
-            if self.basketball_class_indices:
-                print(f"Basketball class indices: {self.basketball_class_indices}")
-            else:
-                print("No basketball-related classes found in model. Will detect all objects.")
-                # If no basketball classes found, we'll detect all objects
-                for idx, name in self.model.names.items():
-                    self.basketball_class_indices.append(idx)
+            names = self.model.names
+            items = list(names.items()) if isinstance(names, dict) else list(enumerate(names))
+            ball_like = [idx for idx, name in items if any(k in str(name).lower() for k in ("ball", "basketball", "sports ball"))]
+            self.basketball_class_indices = ball_like or [idx for idx, _ in items]
         
     def _create_tracker_config(self):
         """
@@ -182,7 +137,7 @@ class BasketballTracker:
         self.trajectories = {}
         
         # Create video capture object
-        cap = cv2.VideoCapture("data/video/travel.mov")
+        cap = cv2.VideoCapture(source)
         
         # Check if camera opened successfully
         if not cap.isOpened():
@@ -205,14 +160,7 @@ class BasketballTracker:
         use_detection_mode = True  # Start with detection mode by default
         conf_threshold = 0.1  # Start with a very low confidence threshold
         
-        # Debug counter for frames
-        frame_count = 0
-        detection_count = 0
-        
         while True:
-            # Start timing for FPS calculation
-            self.performance_monitor.start_frame()
-            
             # Read a frame
             ret, frame = cap.read()
             if not ret:
@@ -221,23 +169,14 @@ class BasketballTracker:
                 
             # Create a copy of the frame for processing
             processed_frame = frame.copy()
-            frame_count += 1
-            
-            # Print debug info every 30 frames
-            debug_frame = (frame_count % 30 == 0)
+            # Start timing for FPS calculation
+            self.performance_monitor.start_frame()
             
             try:
                 if use_detection_mode:
                     # Run detection on the frame (no tracking)
                     results = self.model(frame, conf=conf_threshold, show=False, verbose=False)
                     if results and len(results) > 0:
-                        if debug_frame and hasattr(results[0], 'boxes') and hasattr(results[0].boxes, 'cls'):
-                            classes = results[0].boxes.cls.int().cpu().tolist() if hasattr(results[0].boxes, 'cls') else []
-                            confs = results[0].boxes.conf.float().cpu().tolist() if hasattr(results[0].boxes, 'conf') else []
-                            print(f"Detection: Found {len(classes)} objects, classes: {classes}, confidences: {[round(c, 2) for c in confs]}")
-                            if classes:
-                                detection_count += 1
-                        
                         processed_frame = self._process_and_visualize_detections(processed_frame, results[0])
                 else:
                     # Try tracking first
@@ -251,13 +190,6 @@ class BasketballTracker:
                         )
                         
                         if results and len(results) > 0:
-                            if debug_frame and hasattr(results[0], 'boxes') and hasattr(results[0].boxes, 'cls'):
-                                classes = results[0].boxes.cls.int().cpu().tolist() if hasattr(results[0].boxes, 'cls') else []
-                                track_ids = results[0].boxes.id.int().cpu().tolist() if hasattr(results[0].boxes, 'id') else []
-                                print(f"Tracking: Found {len(classes)} objects, classes: {classes}, track IDs: {track_ids}")
-                                if classes:
-                                    detection_count += 1
-                            
                             processed_frame = self._process_and_visualize_results(processed_frame, results[0])
                         else:
                             # If tracking returns no results, fall back to detection
@@ -285,17 +217,7 @@ class BasketballTracker:
                 2
             )
             
-            # Add detection rate
-            if frame_count > 0:
-                cv2.putText(
-                    processed_frame,
-                    f"Detection rate: {detection_count}/{frame_count} ({100*detection_count/frame_count:.1f}%)",
-                    (20, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 0),
-                    2
-                )
+            # (removed detection-rate debug overlay)
             
             # Resize for display if needed
             if display_scale != 1.0:
@@ -547,11 +469,10 @@ class BasketballTracker:
         Returns:
             tuple: RGB color
         """
-        # Generate a deterministic color based on the track ID
-        np.random.seed(int(track_id * 9999))
-        r = np.random.randint(0, 256)
-        g = np.random.randint(0, 256)
-        b = np.random.randint(0, 256)
+        # Generate a deterministic color based on the track ID without affecting global RNG
+        seed = int(track_id * 9999) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+        r, g, b = rng.integers(0, 256, size=3).tolist()
         
         # Ensure the color is bright enough to be visible
         if (r + g + b) < 300:

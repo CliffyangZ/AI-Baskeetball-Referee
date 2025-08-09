@@ -1,10 +1,6 @@
-from ultralytics import YOLO
 import cv2
 import numpy as np
-import time
 from collections import deque
-import yaml
-import os
 
 from BasketballTracker import BasketballTracker
 from KalmanFilter import BasketballKalmanFilter
@@ -155,8 +151,8 @@ class EnhancedBasketballTracker(BasketballTracker):
             
             # Connect to previous point
             if i == 1:
-                cv2.line(frame, last_point, (next_x, next_y), color, 1, cv2.LINE_DASHED)
+                cv2.line(frame, last_point, (next_x, next_y), color, 1, cv2.LINE_AA)
             else:
                 prev_x = int(last_point[0] + vx * (i-1))
                 prev_y = int(last_point[1] + vy * (i-1))
-                cv2.line(frame, (prev_x, prev_y), (next_x, next_y), color, 1, cv2.LINE_DASHED)
+                cv2.line(frame, (prev_x, prev_y), (next_x, next_y), color, 1, cv2.LINE_AA)
