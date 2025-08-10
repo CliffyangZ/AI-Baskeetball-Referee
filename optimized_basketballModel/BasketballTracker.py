@@ -36,33 +36,8 @@ class BasketballTracker:
         # Print model information
         if hasattr(self.model, 'names'):
             print(f"Model classes: {self.model.names}")
-        """
-        # Test the model on a simple image to verify it works
-        try:
-            # Create a test image (black background)
-            test_img = np.zeros((640, 640, 3), dtype=np.uint8)
-            # Draw a white circle (simulating a ball)
-            cv2.circle(test_img, (320, 320), 50, (255, 255, 255), -1)
-            
-            # Run inference on test image
-            test_results = self.model(test_img, verbose=False)
-            if test_results and len(test_results) > 0 and hasattr(test_results[0], 'boxes'):
-                boxes = test_results[0].boxes
-                if len(boxes) > 0:
-                    print(f"Model test successful! Detected {len(boxes)} objects in test image")
-                    if hasattr(boxes, 'cls'):
-                        classes = boxes.cls.int().cpu().tolist()
-                        print(f"Detected classes: {classes}")
-                        if hasattr(self.model, 'names'):
-                            class_names = [self.model.names[int(c)] for c in classes]
-                            print(f"Class names: {class_names}")
-                else:
-                    print("Model test: No objects detected in test image")
-            else:
-                print("Model test: No results from test inference")
-        except Exception as e:
-            print(f"Model test failed: {e}")
-        """
+        print(f"Model test failed: {e}")
+        
         # Create ByteTrack configuration file if it doesn't exist
         self.tracker_config = self._create_tracker_config()
         
