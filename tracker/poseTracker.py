@@ -40,9 +40,21 @@ from __future__ import annotations
 from typing import List, Optional, Tuple, Dict
 import time
 
+import os
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+def _is_openvino_model_path(p: Optional[str]) -> bool:
+    """Return True if path points to an OpenVINO IR (.xml) file or a directory containing one."""
+    if not p:
+        return False
+    try:
+        if os.path.isdir(p):
+            return any(name.lower().endswith(".xml") for name in os.listdir(p))
+        return str(p).lower().endswith(".xml")
+    except Exception:
+        return False
 
 
 COCO_KPT_NAMES = [
@@ -55,7 +67,18 @@ COCO_KPT_NAMES = [
 
 class PoseTracker:
     def __init__(self, model_path: Optional[str] = "pt_models/yolov8s-pose.pt", device: str = 'cpu') -> None:
-        self.model = YOLO(model_path)
+        self.is_openvino = _is_openvino_model_path(model_path)
+        model_load_path = model_path
+        if self.is_openvino and model_path and os.path.isdir(model_path):
+            xmls = [os.path.join(model_path, n) for n in os.listdir(model_path) if n.lower().endswith('.xml')]
+            if not xmls:
+                raise FileNotFoundError(f"No .xml found in OpenVINO dir: {model_path}")
+            model_load_path = xmls[0]
+        if self.is_openvino:
+            print(f"[PoseTracker] Using OpenVINO IR model: {model_load_path}")
+        else:
+            print(f"[PoseTracker] Using model: {model_load_path}")
+        self.model = YOLO(model_load_path)
         self.device = device
         self._last_time = time.time()
 
