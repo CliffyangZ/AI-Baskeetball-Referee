@@ -6,3 +6,5 @@ __pycache__
 train_hoopModel/
 byteTrack_meth.md
 models/
+.gitignore
+train_basketballModel/

@@ -1,43 +1,49 @@
 """
-Pose Tracker with OpenVINO Runtime Inference
+Pose Tracker with OpenVINO Runtime Inference for YOLO Pose Models
 
-This module implements human pose estimation and tracking using OpenVINO for
-optimized inference with support for multiple pose estimation models.
+This module implements human pose detection using OpenVINO for optimized inference.
+Designed for AI referee system integration with YOLO pose model support.
+No tracking functionality - pure pose detection and keypoint extraction.
 """
 
 import numpy as np
 import cv2
 import openvino as ov
-from typing import List, Tuple, Optional, Dict, Any, Union
-from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Any
 from enum import Enum
+from dataclasses import dataclass
 import logging
 from pathlib import Path
-import math
+import time
 
 # Import utilities
-from utils.KalmanFilter import BasketballKalmanFilter
-from utils.image_utils import bgr_to_rgb, frame_to_base64_png
+try:
+    from .utils.image_utils import bgr_to_rgb, frame_to_base64_png
+    from .utils.matching import calculate_iou
+    from .utils.openvino_utils import (
+        DeviceType, OpenVINOInferenceEngine, FPSCounter, 
+        normalize_coordinates, ensure_frame_bounds, BaseOptimizedModel
+    )
+except ImportError:
+    from utils.image_utils import bgr_to_rgb, frame_to_base64_png
+    from utils.matching import calculate_iou
+    from utils.openvino_utils import (
+        DeviceType, OpenVINOInferenceEngine, FPSCounter, 
+        normalize_coordinates, ensure_frame_bounds, BaseOptimizedModel
+    )
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class DeviceType(Enum):
-    """Supported OpenVINO device types"""
-    CPU = "CPU"
-    GPU = "GPU"
-    NPU = "NPU"
-    AUTO = "AUTO"
+# DeviceType now imported from openvino_utils
 
 
 class PoseModel(Enum):
-    """Supported pose estimation models"""
-    OPENPOSE = "openpose"
-    MOVENET = "movenet"
+    """Supported pose model types"""
     YOLOV8_POSE = "yolov8_pose"
-    HRNET = "hrnet"
+    YOLOV11_POSE = "yolov11_pose"
 
 
 @dataclass
@@ -45,321 +51,127 @@ class Keypoint:
     """Single keypoint with coordinates and confidence"""
     x: float
     y: float
-    confidence: float = 0.0
+    confidence: float
+    visible: bool = True
+    
+    def to_tuple(self) -> Tuple[float, float, float]:
+        """Convert to tuple format"""
+        return (self.x, self.y, self.confidence)
 
 
 @dataclass
-class Pose:
-    """Human pose with keypoints"""
-    keypoints: List[Keypoint]
-    bbox: Optional[Tuple[float, float, float, float]] = None  # x1, y1, x2, y2
-    confidence: float = 0.0
-    person_id: Optional[int] = None
-
-
-@dataclass
-class PoseTrack:
-    """Pose track for multi-person tracking"""
-    track_id: int
-    pose: Pose
-    state: str = "active"  # active, lost, removed
-    age: int = 0
-    hits: int = 0
-    time_since_update: int = 0
-    kalman_filter: Optional[BasketballKalmanFilter] = None
+class PoseDetection:
+    """Human pose detection result"""
+    bbox: Tuple[float, float, float, float]  # x1, y1, x2, y2
+    keypoints: List[Keypoint]  # 17 COCO keypoints
+    confidence: float
+    person_id: int = 0
     
     def __post_init__(self):
-        if self.kalman_filter is None and self.pose.bbox is not None:
-            self.kalman_filter = BasketballKalmanFilter()
-            # Initialize with center position and zero velocity
-            cx = (self.pose.bbox[0] + self.pose.bbox[2]) / 2
-            cy = (self.pose.bbox[1] + self.pose.bbox[3]) / 2
-            self.kalman_filter.initialize(np.array([cx, cy, 0, 0]))
+        """Calculate additional properties"""
+        # Calculate center from bbox
+        x1, y1, x2, y2 = self.bbox
+        self.center = ((x1 + x2) / 2, (y1 + y2) / 2)
+        
+        # Calculate average keypoint confidence
+        valid_keypoints = [kp for kp in self.keypoints if kp.confidence > 0.3]
+        self.avg_keypoint_confidence = np.mean([kp.confidence for kp in valid_keypoints]) if valid_keypoints else 0.0
 
 
 class PoseTracker:
     """
-    Pose Tracker using OpenVINO Runtime
+    Pose Tracker using OpenVINO Runtime for YOLO Pose Models
     
     Features:
     - OpenVINO optimized inference
-    - Multiple pose model support
-    - Multi-person tracking
-    - Keypoint smoothing with Kalman filtering
+    - YOLO pose model support (YOLOv8-Pose, YOLOv11-Pose)
+    - COCO 17-keypoint format
+    - Real-time pose detection
+    - No tracking - pure detection
     """
     
-    # COCO pose keypoint indices
-    COCO_KEYPOINTS = [
-        "nose", "left_eye", "right_eye", "left_ear", "right_ear",
-        "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-        "left_wrist", "right_wrist", "left_hip", "right_hip",
-        "left_knee", "right_knee", "left_ankle", "right_ankle"
-    ]
-
-# Export COCO keypoint names for compatibility
-COCO_KPT_NAMES = [
-    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
-    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-    "left_wrist", "right_wrist", "left_hip", "right_hip",
-    "left_knee", "right_knee", "left_ankle", "right_ankle"
-]
-
-
-class PoseTracker:
-    """
-    Pose Tracker using OpenVINO Runtime
-    
-    Features:
-    - OpenVINO optimized inference
-    - Multiple pose model support
-    - Multi-person tracking
-    - Keypoint smoothing with Kalman filtering
-    """
-    
-    # COCO pose keypoint indices
-    COCO_KEYPOINTS = [
-        "nose", "left_eye", "right_eye", "left_ear", "right_ear",
-        "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-        "left_wrist", "right_wrist", "left_hip", "right_hip",
-        "left_knee", "right_knee", "left_ankle", "right_ankle"
+    # COCO 17 keypoint names
+    COCO_KEYPOINT_NAMES = [
+        'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
+        'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+        'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+        'left_knee', 'right_knee', 'left_ankle', 'right_ankle'
     ]
     
-    # Skeleton connections for drawing
-    SKELETON_CONNECTIONS = [
-        (0, 1), (0, 2), (1, 3), (2, 4),  # Head
-        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # Arms
-        (11, 12), (5, 11), (6, 12),  # Torso
-        (11, 13), (13, 15), (12, 14), (14, 16)  # Legs
+    # COCO skeleton connections for drawing
+    COCO_SKELETON = [
+        [16, 14], [14, 12], [17, 15], [15, 13], [12, 13],
+        [6, 12], [7, 13], [6, 7], [6, 8], [7, 9],
+        [8, 10], [9, 11], [2, 3], [1, 2], [1, 3],
+        [2, 4], [3, 5], [4, 6], [5, 7]
     ]
     
     def __init__(
         self,
         model_path: str,
         device: DeviceType = DeviceType.CPU,
-        model_type: PoseModel = PoseModel.YOLOV8_POSE,
-        confidence_threshold: float = 0.3,
-        max_time_lost: int = 30
+        pose_model: PoseModel = PoseModel.YOLOV8_POSE,
+        confidence_threshold: float = 0.5,
+        keypoint_threshold: float = 0.3
     ):
         """
-        Initialize Pose Tracker
+        Initialize Pose Tracker for AI referee
         
         Args:
             model_path: Path to OpenVINO IR model (.xml file)
             device: OpenVINO device type
-            model_type: Type of pose estimation model
+            pose_model: Type of pose model
             confidence_threshold: Minimum confidence for pose detection
-            max_time_lost: Maximum frames to keep lost tracks
+            keypoint_threshold: Minimum confidence for keypoint visibility
         """
         self.model_path = Path(model_path)
         self.device = device
-        self.model_type = model_type
+        self.pose_model = pose_model
         self.confidence_threshold = confidence_threshold
-        self.max_time_lost = max_time_lost
+        self.keypoint_threshold = keypoint_threshold
         
-        # Initialize OpenVINO
-        self._init_openvino()
+        # Initialize OpenVINO engine
+        self.inference_engine = OpenVINOInferenceEngine(model_path, device)
         
-        # Tracking state
-        self.tracks: List[PoseTrack] = []
-        self.track_id_counter = 0
-        self.frame_count = 0
+        # Performance monitoring
+        self.fps_counter = FPSCounter()
         
-        logger.info(f"PoseTracker initialized with device: {device.value}, model: {model_type.value}")
+        logger.info(f"PoseTracker initialized with device: {device.value}, model: {pose_model.value}")
     
-    def _init_openvino(self):
-        """Initialize OpenVINO Core and compile model"""
-        try:
-            # Initialize OpenVINO Core
-            self.core = ov.Core()
-            
-            # Read model
-            logger.info(f"Loading model from: {self.model_path}")
-            self.model = self.core.read_model(self.model_path)
-            
-            # Compile model
-            self.compiled_model = self.core.compile_model(
-                model=self.model, 
-                device_name=self.device.value
-            )
-            
-            # Get input/output info
-            self.input_layer = self.compiled_model.input(0)
-            self.output_layers = [self.compiled_model.output(i) for i in range(len(self.compiled_model.outputs))]
-            
-            # Get input shape
-            self.input_shape = self.input_layer.shape
-            self.input_height = self.input_shape[2]
-            self.input_width = self.input_shape[3]
-            
-            logger.info(f"Model loaded successfully. Input shape: {self.input_shape}")
-            logger.info(f"Number of outputs: {len(self.output_layers)}")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize OpenVINO: {e}")
-            raise
+    # OpenVINO initialization and preprocessing now handled by inference_engine
     
-    def preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Preprocess frame for model inference
+    def apply_nms(self, detections: List[PoseDetection], iou_threshold: float = 0.5) -> List[PoseDetection]:
+        """Apply Non-Maximum Suppression to remove duplicate detections using utils"""
+        if len(detections) <= 1:
+            return detections
         
-        Args:
-            frame: Input BGR frame
+        # Sort by confidence (highest first)
+        detections = sorted(detections, key=lambda x: x.confidence, reverse=True)
+        
+        keep = []
+        while detections:
+            # Keep the highest confidence detection
+            current = detections.pop(0)
+            keep.append(current)
             
-        Returns:
-            Preprocessed tensor ready for inference
-        """
-        # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Resize to model input size
-        resized = cv2.resize(rgb_frame, (self.input_width, self.input_height))
-        
-        # Normalize based on model type
-        if self.model_type in [PoseModel.YOLOV8_POSE, PoseModel.MOVENET]:
-            # Normalize to [0, 1]
-            normalized = resized.astype(np.float32) / 255.0
-        else:
-            # Normalize to [-1, 1] for some models
-            normalized = (resized.astype(np.float32) / 127.5) - 1.0
-        
-        # Add batch dimension and transpose to NCHW
-        input_tensor = np.transpose(normalized, (2, 0, 1))
-        input_tensor = np.expand_dims(input_tensor, axis=0)
-        
-        return input_tensor
-    
-    def postprocess_yolov8_pose(
-        self, 
-        outputs: List[np.ndarray], 
-        frame_shape: Tuple[int, int]
-    ) -> List[Pose]:
-        """Postprocess YOLOv8 pose model outputs"""
-        poses = []
-        frame_height, frame_width = frame_shape
-        
-        # Scale factors
-        scale_x = frame_width / self.input_width
-        scale_y = frame_height / self.input_height
-        
-        # YOLOv8 pose output format: [batch, 56, 8400]
-        # 56 = 4 (bbox) + 1 (conf) + 51 (17 keypoints * 3)
-        if len(outputs) > 0:
-            output = outputs[0]
-            if len(output.shape) == 3:
-                output = output[0]  # Remove batch dimension
+            # Remove detections with high IoU overlap using utils function
+            remaining = []
+            for det in detections:
+                iou = calculate_iou(current.bbox, det.bbox)
+                if iou < iou_threshold:
+                    remaining.append(det)
             
-            # Transpose to [8400, 56]
-            if output.shape[0] == 56:
-                output = output.T
-            
-            for detection in output:
-                if len(detection) >= 56:
-                    # Extract bbox and confidence
-                    cx, cy, w, h, conf = detection[:5]
-                    
-                    if conf < self.confidence_threshold:
-                        continue
-                    
-                    # Convert center format to corner format
-                    x1 = (cx - w/2) * scale_x
-                    y1 = (cy - h/2) * scale_y
-                    x2 = (cx + w/2) * scale_x
-                    y2 = (cy + h/2) * scale_y
-                    
-                    # Clamp to frame boundaries
-                    x1 = max(0, min(x1, frame_width))
-                    y1 = max(0, min(y1, frame_height))
-                    x2 = max(0, min(x2, frame_width))
-                    y2 = max(0, min(y2, frame_height))
-                    
-                    # Extract keypoints
-                    keypoints = []
-                    for i in range(17):  # 17 COCO keypoints
-                        kp_x = detection[5 + i*3] * scale_x
-                        kp_y = detection[5 + i*3 + 1] * scale_y
-                        kp_conf = detection[5 + i*3 + 2]
-                        
-                        # Clamp keypoint coordinates
-                        kp_x = max(0, min(kp_x, frame_width))
-                        kp_y = max(0, min(kp_y, frame_height))
-                        
-                        keypoints.append(Keypoint(kp_x, kp_y, kp_conf))
-                    
-                    poses.append(Pose(
-                        keypoints=keypoints,
-                        bbox=(x1, y1, x2, y2),
-                        confidence=float(conf)
-                    ))
+            detections = remaining
         
-        return poses
-    
-    def postprocess_openpose(
-        self, 
-        outputs: List[np.ndarray], 
-        frame_shape: Tuple[int, int]
-    ) -> List[Pose]:
-        """Postprocess OpenPose model outputs"""
-        poses = []
-        frame_height, frame_width = frame_shape
-        
-        if len(outputs) > 0:
-            # OpenPose output: [1, 57, H, W] where 57 = 18 keypoints + 19 PAFs
-            heatmaps = outputs[0]
-            if len(heatmaps.shape) == 4:
-                heatmaps = heatmaps[0]  # Remove batch dimension
-            
-            # Extract keypoint heatmaps (first 18 channels)
-            keypoint_heatmaps = heatmaps[:18]
-            
-            # Find peaks in heatmaps
-            keypoints = []
-            for i, heatmap in enumerate(keypoint_heatmaps):
-                # Find maximum in heatmap
-                max_val = np.max(heatmap)
-                if max_val > self.confidence_threshold:
-                    max_loc = np.unravel_index(np.argmax(heatmap), heatmap.shape)
-                    y, x = max_loc
-                    
-                    # Scale to original frame size
-                    scaled_x = x * frame_width / heatmap.shape[1]
-                    scaled_y = y * frame_height / heatmap.shape[0]
-                    
-                    keypoints.append(Keypoint(scaled_x, scaled_y, max_val))
-                else:
-                    keypoints.append(Keypoint(0, 0, 0))
-            
-            if len(keypoints) > 0:
-                # Calculate bounding box from visible keypoints
-                visible_kps = [kp for kp in keypoints if kp.confidence > 0.1]
-                if visible_kps:
-                    xs = [kp.x for kp in visible_kps]
-                    ys = [kp.y for kp in visible_kps]
-                    x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-                    
-                    # Add padding
-                    padding = 20
-                    x1 = max(0, x1 - padding)
-                    y1 = max(0, y1 - padding)
-                    x2 = min(frame_width, x2 + padding)
-                    y2 = min(frame_height, y2 + padding)
-                    
-                    avg_conf = np.mean([kp.confidence for kp in visible_kps])
-                    
-                    poses.append(Pose(
-                        keypoints=keypoints,
-                        bbox=(x1, y1, x2, y2),
-                        confidence=avg_conf
-                    ))
-        
-        return poses
-    
+        return keep
+
     def postprocess_detections(
         self, 
-        outputs: List[np.ndarray], 
+        outputs: np.ndarray, 
         frame_shape: Tuple[int, int]
-    ) -> List[Pose]:
+    ) -> List[PoseDetection]:
         """
-        Postprocess model outputs based on model type
+        Postprocess model outputs to extract pose detections
         
         Args:
             outputs: Raw model outputs
@@ -368,177 +180,70 @@ class PoseTracker:
         Returns:
             List of pose detections
         """
-        if self.model_type == PoseModel.YOLOV8_POSE:
-            return self.postprocess_yolov8_pose(outputs, frame_shape)
-        elif self.model_type == PoseModel.OPENPOSE:
-            return self.postprocess_openpose(outputs, frame_shape)
-        else:
-            # Generic postprocessing for other models
-            return self.postprocess_yolov8_pose(outputs, frame_shape)
-    
-    def calculate_pose_similarity(self, pose1: Pose, pose2: Pose) -> float:
-        """Calculate similarity between two poses using keypoint distances"""
-        if not pose1.keypoints or not pose2.keypoints:
-            return 0.0
+        detections = []
+        frame_height, frame_width = frame_shape
         
-        if len(pose1.keypoints) != len(pose2.keypoints):
-            return 0.0
+        # Handle different output formats
+        if len(outputs.shape) == 3:
+            outputs = outputs[0]  # Remove batch dimension
         
-        total_distance = 0.0
-        valid_keypoints = 0
+        # Check if we need to transpose (YOLOv8-Pose format might be [56, 8400])
+        # Format: [x, y, w, h, conf, kp1_x, kp1_y, kp1_conf, ..., kp17_x, kp17_y, kp17_conf]
+        if outputs.shape[0] < outputs.shape[1] and outputs.shape[0] <= 56:
+            outputs = outputs.T
         
-        for kp1, kp2 in zip(pose1.keypoints, pose2.keypoints):
-            if kp1.confidence > 0.1 and kp2.confidence > 0.1:
-                distance = math.sqrt((kp1.x - kp2.x)**2 + (kp1.y - kp2.y)**2)
-                total_distance += distance
-                valid_keypoints += 1
-        
-        if valid_keypoints == 0:
-            return 0.0
-        
-        # Normalize by average distance and convert to similarity
-        avg_distance = total_distance / valid_keypoints
-        similarity = 1.0 / (1.0 + avg_distance / 100.0)  # Normalize by 100 pixels
-        
-        return similarity
-    
-    def calculate_bbox_iou(self, bbox1: Tuple[float, float, float, float], 
-                          bbox2: Tuple[float, float, float, float]) -> float:
-        """Calculate IoU between two bounding boxes"""
-        x1_1, y1_1, x2_1, y2_1 = bbox1
-        x1_2, y1_2, x2_2, y2_2 = bbox2
-        
-        # Calculate intersection
-        x1_i = max(x1_1, x1_2)
-        y1_i = max(y1_1, y1_2)
-        x2_i = min(x2_1, x2_2)
-        y2_i = min(y2_1, y2_2)
-        
-        if x2_i <= x1_i or y2_i <= y1_i:
-            return 0.0
-        
-        intersection = (x2_i - x1_i) * (y2_i - y1_i)
-        
-        # Calculate union
-        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-        union = area1 + area2 - intersection
-        
-        return intersection / union if union > 0 else 0.0
-    
-    def update_tracks(self, poses: List[Pose]) -> List[PoseTrack]:
-        """
-        Update pose tracks
-        
-        Args:
-            poses: List of detected poses
-            
-        Returns:
-            List of active pose tracks
-        """
-        self.frame_count += 1
-        
-        # Predict track positions using Kalman filter
-        for track in self.tracks:
-            if track.kalman_filter and track.kalman_filter.initialized:
-                try:
-                    predicted_pos = track.kalman_filter.predict()
-                    if predicted_pos is not None and len(predicted_pos) >= 2 and track.pose.bbox:
-                        # Update bbox center based on prediction
-                        cx, cy = predicted_pos[0], predicted_pos[1]
-                        w = track.pose.bbox[2] - track.pose.bbox[0]
-                        h = track.pose.bbox[3] - track.pose.bbox[1]
-                        track.pose.bbox = (cx - w/2, cy - h/2, cx + w/2, cy + h/2)
-                except:
-                    pass  # Continue with previous bbox if prediction fails
-        
-        # Associate poses with tracks
-        active_tracks = [t for t in self.tracks if t.state == "active"]
-        
-        # Simple association based on bbox IoU and pose similarity
-        matches = []
-        unmatched_tracks = list(range(len(active_tracks)))
-        unmatched_poses = list(range(len(poses)))
-        
-        # Calculate similarity matrix
-        if active_tracks and poses:
-            similarity_matrix = np.zeros((len(active_tracks), len(poses)))
-            
-            for t, track in enumerate(active_tracks):
-                for p, pose in enumerate(poses):
-                    # Combine bbox IoU and pose similarity
-                    bbox_sim = 0.0
-                    if track.pose.bbox and pose.bbox:
-                        bbox_sim = self.calculate_bbox_iou(track.pose.bbox, pose.bbox)
+        # Process each detection
+        for detection in outputs:
+            if len(detection) >= 56:  # 4 bbox + 1 conf + 51 keypoints (17*3)
+                # Extract bbox and confidence
+                x_center, y_center, width, height, confidence = detection[:5]
+                
+                # Filter by confidence threshold
+                if confidence >= self.confidence_threshold:
+                    # Convert normalized coordinates to pixel coordinates using utils
+                    input_size = (self.inference_engine.input_width, self.inference_engine.input_height)
+                    frame_size = (frame_width, frame_height)
+                    x1, y1, x2, y2 = normalize_coordinates(
+                        (x_center, y_center, width, height), input_size, frame_size
+                    )
                     
-                    pose_sim = self.calculate_pose_similarity(track.pose, pose)
+                    # Extract keypoints (17 keypoints * 3 values each)
+                    keypoints = []
+                    for i in range(17):
+                        kp_start_idx = 5 + i * 3
+                        if kp_start_idx + 2 < len(detection):
+                            kp_x = (detection[kp_start_idx] / self.inference_engine.input_width) * frame_width
+                            kp_y = (detection[kp_start_idx + 1] / self.inference_engine.input_height) * frame_height
+                            kp_conf = detection[kp_start_idx + 2]
+                            
+                            # Ensure keypoint coordinates are within frame bounds using utils
+                            kp_x, kp_y = ensure_frame_bounds((kp_x, kp_y), (frame_width, frame_height))
+                            
+                            keypoint = Keypoint(
+                                x=float(kp_x),
+                                y=float(kp_y),
+                                confidence=float(kp_conf),
+                                visible=kp_conf > self.keypoint_threshold
+                            )
+                            keypoints.append(keypoint)
+                        else:
+                            # Add dummy keypoint if data is missing
+                            keypoints.append(Keypoint(0.0, 0.0, 0.0, False))
                     
-                    # Weighted combination (more weight on bbox for better tracking)
-                    similarity_matrix[t, p] = 0.6 * bbox_sim + 0.4 * pose_sim
-            
-            # Improved matching with sorted similarity scores
-            potential_matches = []
-            for t in range(len(active_tracks)):
-                for p in range(len(poses)):
-                    if similarity_matrix[t, p] > 0.2:  # Lower threshold for better association
-                        potential_matches.append((similarity_matrix[t, p], t, p))
-            
-            # Sort by similarity score descending
-            potential_matches.sort(reverse=True)
-            
-            # Assign matches greedily, starting with highest similarity
-            for sim_score, t, p in potential_matches:
-                if t in unmatched_tracks and p in unmatched_poses:
-                    matches.append((t, p))
-                    unmatched_tracks.remove(t)
-                    unmatched_poses.remove(p)
+                    # Create pose detection
+                    pose_detection = PoseDetection(
+                        bbox=(x1, y1, x2, y2),
+                        keypoints=keypoints,
+                        confidence=float(confidence)
+                    )
+                    detections.append(pose_detection)
         
-        # Update matched tracks
-        for track_idx, pose_idx in matches:
-            track = active_tracks[track_idx]
-            pose = poses[pose_idx]
-            
-            track.pose = pose
-            track.hits += 1
-            track.time_since_update = 0
-            
-            # Update Kalman filter
-            if track.kalman_filter and track.kalman_filter.initialized and pose.bbox:
-                try:
-                    cx = (pose.bbox[0] + pose.bbox[2]) / 2
-                    cy = (pose.bbox[1] + pose.bbox[3]) / 2
-                    track.kalman_filter.update(np.array([cx, cy]))
-                except:
-                    pass
+        # Apply NMS to remove duplicate detections
+        detections = self.apply_nms(detections, iou_threshold=0.5)
         
-        # Create new tracks for unmatched poses
-        for pose_idx in unmatched_poses:
-            pose = poses[pose_idx]
-            new_track = PoseTrack(
-                track_id=self.track_id_counter,
-                pose=pose,
-                hits=1
-            )
-            self.tracks.append(new_track)
-            self.track_id_counter += 1
-        
-        # Update track states and remove old tracks
-        for track in self.tracks[:]:
-            track.age += 1
-            if track.time_since_update == 0:
-                continue
-            
-            track.time_since_update += 1
-            
-            if track.state == "active" and track.time_since_update > 1:
-                track.state = "lost"
-            elif track.time_since_update > self.max_time_lost:
-                self.tracks.remove(track)
-        
-        # Return active tracks
-        return [t for t in self.tracks if t.state == "active"]
+        return detections
     
-    def infer_frame(self, frame: np.ndarray) -> Tuple[List[PoseTrack], np.ndarray]:
+    def infer_frame(self, frame: np.ndarray) -> Tuple[List[PoseDetection], np.ndarray]:
         """
         Run pose inference on a single frame
         
@@ -546,146 +251,177 @@ class PoseTracker:
             frame: Input BGR frame
             
         Returns:
-            Tuple of (active_tracks, annotated_frame)
+            Tuple of (pose_detections, annotated_frame)
         """
-        # Preprocess frame
-        input_tensor = self.preprocess_frame(frame)
-        
-        # Run inference
         try:
-            results = self.compiled_model([input_tensor])
-            outputs = [results[layer] for layer in self.output_layers]
+            # Update FPS counter
+            current_fps = self.fps_counter.update()
+            
+            # Preprocess frame and run inference using engine
+            input_tensor = self.inference_engine.preprocess_frame(frame)
+            outputs = self.inference_engine.infer(input_tensor)
+            
+            # Postprocess detections
+            pose_detections = self.postprocess_detections(outputs, frame.shape[:2])
+            
+            # Draw annotations
+            annotated_frame = self.draw_poses(frame.copy(), pose_detections)
+            
+            return pose_detections, annotated_frame
+            
         except Exception as e:
-            logger.error(f"Inference failed: {e}")
-            return [], frame
-        
-        # Postprocess detections
-        poses = self.postprocess_detections(outputs, frame.shape[:2])
-        
-        # Update tracks
-        active_tracks = self.update_tracks(poses)
-        
-        # Draw clean annotations without trails
-        annotated_frame = self.draw_clean_poses(frame.copy(), active_tracks)
-        
-        return active_tracks, annotated_frame
+            logger.error(f"Pose inference failed: {e}")
+            return [], frame.copy()
     
-    def draw_clean_poses(self, frame: np.ndarray, tracks: List[PoseTrack]) -> np.ndarray:
-        """Draw only current pose keypoints and skeleton without trails or history"""
-        # Ensure we're working with a fresh copy of the frame
-        clean_frame = frame.copy()
+    def get_human_poses(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        Get human pose information for AI referee system
         
-        colors = [
-            (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
-            (255, 0, 255), (0, 255, 255), (128, 0, 128), (255, 165, 0)
-        ]
+        Args:
+            frame: Input BGR frame
+            
+        Returns:
+            List of dictionaries containing pose information
+        """
+        pose_detections, _ = self.infer_frame(frame)
         
-        for i, track in enumerate(tracks):
-            color = colors[i % len(colors)]
-            pose = track.pose
-            
-            # Draw clean bounding box
-            if pose.bbox:
-                x1, y1, x2, y2 = map(int, pose.bbox)
-                
-                # Ensure coordinates are valid
-                if x2 > x1 and y2 > y1:
-                    cv2.rectangle(clean_frame, (x1, y1), (x2, y2), color, 2)
-                    
-                    # Draw track ID with background for better visibility
-                    label = f"Person {track.track_id}"
-                    label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                    
-                    # Draw background rectangle for text
-                    cv2.rectangle(clean_frame, (x1, y1 - label_size[1] - 10), 
-                                 (x1 + label_size[0], y1), color, -1)
-                    
-                    # Draw text
-                    cv2.putText(clean_frame, label, (x1, y1 - 5), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            # Draw clean keypoints
+        poses_info = []
+        for i, pose in enumerate(pose_detections):
+            # Convert keypoints to dictionary format
+            keypoints_dict = {}
             for j, keypoint in enumerate(pose.keypoints):
-                if keypoint.confidence > 0.5:  # Higher threshold for cleaner display
-                    x, y = int(keypoint.x), int(keypoint.y)
-                    # Draw keypoint with outline for better visibility
-                    cv2.circle(clean_frame, (x, y), 5, (0, 0, 0), -1)  # Black outline
-                    cv2.circle(clean_frame, (x, y), 4, color, -1)  # Colored center
+                keypoint_name = self.COCO_KEYPOINT_NAMES[j]
+                keypoints_dict[keypoint_name] = {
+                    'x': keypoint.x,
+                    'y': keypoint.y,
+                    'confidence': keypoint.confidence,
+                    'visible': keypoint.visible
+                }
             
-            # Draw clean skeleton connections
-            for connection in self.SKELETON_CONNECTIONS:
-                kp1_idx, kp2_idx = connection
-                if (kp1_idx < len(pose.keypoints) and kp2_idx < len(pose.keypoints)):
+            pose_info = {
+                'person_id': i,
+                'bbox': pose.bbox,
+                'center': pose.center,
+                'confidence': pose.confidence,
+                'avg_keypoint_confidence': pose.avg_keypoint_confidence,
+                'keypoints': keypoints_dict,
+                'keypoints_array': [(kp.x, kp.y, kp.confidence) for kp in pose.keypoints]
+            }
+            poses_info.append(pose_info)
+        
+        return poses_info
+    
+    def draw_poses(self, frame: np.ndarray, poses: List[PoseDetection]) -> np.ndarray:
+        """
+        Draw pose detections on frame
+        
+        Args:
+            frame: Input frame
+            poses: List of pose detections
+            
+        Returns:
+            Annotated frame
+        """
+        for i, pose in enumerate(poses):
+            # Draw bounding box
+            x1, y1, x2, y2 = [int(coord) for coord in pose.bbox]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Draw confidence
+            conf_text = f"Person {i}: {pose.confidence:.2f}"
+            cv2.putText(frame, conf_text, (x1, y1 - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Draw keypoints
+            for j, keypoint in enumerate(pose.keypoints):
+                if keypoint.visible and keypoint.confidence > self.keypoint_threshold:
+                    x, y = int(keypoint.x), int(keypoint.y)
+                    # Draw keypoint
+                    cv2.circle(frame, (x, y), 3, (0, 0, 255), -1)
+                    # Draw keypoint name (optional, for debugging)
+                    # cv2.putText(frame, str(j), (x+5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+            
+            # Draw skeleton
+            for connection in self.COCO_SKELETON:
+                kp1_idx, kp2_idx = connection[0] - 1, connection[1] - 1  # Convert to 0-based index
+                if (0 <= kp1_idx < len(pose.keypoints) and 0 <= kp2_idx < len(pose.keypoints)):
                     kp1 = pose.keypoints[kp1_idx]
                     kp2 = pose.keypoints[kp2_idx]
                     
-                    if kp1.confidence > 0.5 and kp2.confidence > 0.5:
+                    if (kp1.visible and kp2.visible and 
+                        kp1.confidence > self.keypoint_threshold and 
+                        kp2.confidence > self.keypoint_threshold):
+                        
                         pt1 = (int(kp1.x), int(kp1.y))
                         pt2 = (int(kp2.x), int(kp2.y))
-                        # Draw line with outline for better visibility
-                        cv2.line(clean_frame, pt1, pt2, (0, 0, 0), 4)  # Black outline
-                        cv2.line(clean_frame, pt1, pt2, color, 2)  # Colored line
+                        cv2.line(frame, pt1, pt2, (255, 0, 0), 2)
         
-        return clean_frame
-    
-    def draw_poses(self, frame: np.ndarray, tracks: List[PoseTrack]) -> np.ndarray:
-        """Draw pose keypoints and skeleton on frame (kept for compatibility)"""
-        return self.draw_clean_poses(frame, tracks)
-    
-    def get_device_info(self) -> Dict[str, Any]:
-        """Get OpenVINO device information"""
+        # Draw FPS and detection count using utils
         try:
-            available_devices = self.core.available_devices
-            device_info = {
-                "available_devices": available_devices,
-                "current_device": self.device.value,
-                "model_path": str(self.model_path),
-                "model_type": self.model_type.value,
-                "input_shape": self.input_shape
-            }
-            return device_info
-        except Exception as e:
-            logger.error(f"Failed to get device info: {e}")
-            return {}
+            from .utils.openvino_utils import draw_fps_info, draw_detection_count
+        except ImportError:
+            from utils.openvino_utils import draw_fps_info, draw_detection_count
+        
+        frame = draw_fps_info(frame, self.fps_counter.get_fps())
+        frame = draw_detection_count(frame, len(poses), "Persons")
+        
+        return frame
+    
+    # FPS calculation now handled by FPSCounter utility
 
 
 # Optimized Pose Model class for compatibility with existing UI code
-class OptimizedPoseModel:
+class OptimizedPoseModel(BaseOptimizedModel):
     """Wrapper class for compatibility with existing UI code"""
     
-    def __init__(self, model_path: str, device: str = "CPU", model_type: str = "yolov8_pose"):
-        device_enum = DeviceType(device.upper())
-        model_type_enum = PoseModel(model_type.lower())
-        self.tracker = PoseTracker(model_path, device_enum, model_type_enum)
+    def __init__(self, model_path: str, device: str = "CPU"):
+        super().__init__(model_path, device)
+        self.tracker = PoseTracker(model_path, self.device_enum)
     
     def infer_frame(self, frame: np.ndarray) -> np.ndarray:
         """Infer frame and return annotated result"""
         _, annotated_frame = self.tracker.infer_frame(frame)
         return annotated_frame
     
-    def get_poses(self, frame: np.ndarray) -> List[PoseTrack]:
-        """Get active pose tracks for a frame"""
-        tracks, _ = self.tracker.infer_frame(frame)
-        return tracks
+    def get_human_poses(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """Get human pose information for AI referee"""
+        return self.tracker.get_human_poses(frame)
 
 
 if __name__ == "__main__":
-    # Example usage
+    # Example usage for AI referee
     model_path = "models/ov_models/yolov8s-pose_openvino_model/yolov8s-pose.xml"
-    tracker = PoseTracker(model_path, DeviceType.CPU, PoseModel.YOLOV8_POSE)
+    tracker = PoseTracker(model_path, DeviceType.CPU)
     
     # Process video
-    cap = cv2.VideoCapture("./data/video/travel.mov")  # or video file path
+    cap = cv2.VideoCapture("./data/video/travel.mov")
+    
+    print("Pose Tracker with OpenVINO Inference")
+    print("Press 'q' to quit")
     
     while True:
         ret, frame = cap.read()
         if not ret:
-            break
+            # Loop video
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
         
-        tracks, annotated_frame = tracker.infer_frame(frame)
+        # Get human poses for AI referee
+        poses_info = tracker.get_human_poses(frame)
         
-        cv2.imshow("Pose Tracking", annotated_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # Display results
+        pose_detections, annotated_frame = tracker.infer_frame(frame)
+        
+        # Print pose information for AI referee
+        for pose in poses_info:
+            print(f"Person {pose['person_id']}: Confidence {pose['confidence']:.2f}, "
+                  f"Center at ({pose['center'][0]:.1f}, {pose['center'][1]:.1f}), "
+                  f"Avg keypoint conf: {pose['avg_keypoint_confidence']:.2f}")
+        
+        cv2.imshow("Pose Detection with OpenVINO", annotated_frame)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
     
     cap.release()
