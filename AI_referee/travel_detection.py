@@ -7,14 +7,11 @@ import tempfile
 from collections import deque
 import os
 import time
-import sys
 
-sys.path.append("/Users/cliffyang/Documents/Program/Basketball_ai_project/models")
-sys.path.append("/Users/cliffyang/Documents/Program/Basketball_ai_project/data")
 
 # Load the YOLO models
-ball_model = YOLO("models/pt_models/basketballModel.pt")
-pose_model = YOLO("models/pt_models/yolov8s-pose.pt")
+ball_model = YOLO("pt_models/basketballModel.pt")
+pose_model = YOLO("pt_models/yolov8s-pose.pt")
 
 # Open the webcam
 cap = cv2.VideoCapture("data/video/Travel.mov")

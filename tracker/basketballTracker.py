@@ -1,279 +1,579 @@
 """
-BasketballTracker: YOLO detection + ByteTrack-style two-stage association (see byteTrack_meth.md).
+Basketball Tracker with OpenVINO Runtime Inference and BYTETrack Algorithm
 
-Input/Output spec
------------------
-class BasketballTracker:
-    __init__(model_path: Optional[str] = None,
-             config_path: Optional[str] = None,
-             device: str = 'cpu')
-        - Loads Ultralytics YOLO model. If model_path is None, uses 'yolov8n.pt'.
-        - Loads ByteTrack-like thresholds from YAML. If config_path is None, loads
-          '<this_dir>/basketball_bytetrack.yaml'.
-
-    infer_frame(frame: np.ndarray, conf: Optional[float] = None) -> tuple[np.ndarray, dict]
-        - frame: BGR image (H,W,3)
-        - conf: optional detection threshold override (fallback to YAML high threshold)
-        - returns (annotated_frame, meta)
-          meta = {
-            'conf': float,                   # detection threshold used
-            'fps': float,                    # rough processing fps
-            'objects': [                     # flat list of detected/tracked objects
-               { 'id': Optional[int], 'cls': str, 'bbox': [x1,y1,x2,y2], 'score': float }
-            ],
-            'tracks': {
-               'person': [ { 'id': int, 'bbox': [...], 'score': float } ],
-               'sports ball': [ { 'id': int, 'bbox': [...], 'score': float } ]
-            }
-          }
-
-Notes
------
-- Association: two stages per byteTrack_meth.md
-  1) Match high-confidence detections to existing tracks using IoU >= match_thresh
-  2) Match remaining tracks with low-confidence detections using IoU >= proximity_thresh
-- New tracks are initialized from unmatched high-confidence detections with conf >= new_track_thresh
-- Tracks are removed if time_since_update > track_buffer
-- This simplified variant uses last bbox (no Kalman) to predict.
+This module implements basketball detection and tracking using OpenVINO for
+optimized inference and BYTETrack for multi-object tracking.
 """
-from __future__ import annotations
 
-import os
-import time
-import yaml
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
-import cv2
 import numpy as np
-from ultralytics import YOLO
+import cv2
+import openvino as ov
+from typing import List, Tuple, Optional, Dict, Any
+from dataclasses import dataclass
+from enum import Enum
+import logging
+from pathlib import Path
 
-def _is_openvino_model_path(p: Optional[str]) -> bool:
-    """Return True if path points to an OpenVINO IR (.xml) file or a directory containing one."""
-    if not p:
-        return False
-    try:
-        if os.path.isdir(p):
-            return any(name.lower().endswith(".xml") for name in os.listdir(p))
-        return str(p).lower().endswith(".xml")
-    except Exception:
-        return False
+# Import utilities
+from utils.KalmanFilter import BasketballKalmanFilter
+from utils.image_utils import bgr_to_rgb, frame_to_base64_png
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class DeviceType(Enum):
+    """Supported OpenVINO device types"""
+    CPU = "CPU"
+    GPU = "GPU"
+    NPU = "NPU"
+    AUTO = "AUTO"
+
+
+@dataclass
+class Detection:
+    """Basketball detection result"""
+    bbox: Tuple[float, float, float, float]  # x1, y1, x2, y2
+    confidence: float
+    class_id: int = 0  # Basketball class
 
 
 @dataclass
 class Track:
-    id: int
-    bbox: np.ndarray  # [x1,y1,x2,y2]
-    score: float
-    cls: str
-    time_since_update: int = 0
+    """Basketball track with BYTETrack implementation"""
+    track_id: int
+    bbox: Tuple[float, float, float, float]
+    confidence: float
+    state: str = "active"  # active, lost, removed
+    age: int = 0
     hits: int = 0
-
-    def update(self, bbox: np.ndarray, score: float):
-        self.bbox = bbox
-        self.score = score
-        self.time_since_update = 0
-        self.hits += 1
+    time_since_update: int = 0
+    kalman_filter: Optional[BasketballKalmanFilter] = None
+    
+    def __post_init__(self):
+        if self.kalman_filter is None:
+            self.kalman_filter = BasketballKalmanFilter()
+            # Initialize with center position and zero velocity
+            cx, cy = (self.bbox[0] + self.bbox[2]) / 2, (self.bbox[1] + self.bbox[3]) / 2
+            self.kalman_filter.initialize(np.array([cx, cy, 0, 0]))
 
 
 class BasketballTracker:
+    """
+    Basketball Tracker using OpenVINO Runtime and BYTETrack algorithm
+    
+    Features:
+    - OpenVINO optimized inference
+    - BYTETrack multi-object tracking
+    - Kalman filtering for smooth trajectories
+    - Configurable confidence thresholds
+    """
+    
     def __init__(
         self,
-        model_path: Optional[str] = "pt_models/basketballModel.pt",
-        config_path: Optional[str] = None,
-        device: str = "cpu",
-    ) -> None:
-        self.device = device
-        self.is_openvino = _is_openvino_model_path(model_path)
-        model_load_path = model_path
-        if self.is_openvino and model_path and os.path.isdir(model_path):
-            xmls = [os.path.join(model_path, n) for n in os.listdir(model_path) if n.lower().endswith('.xml')]
-            if not xmls:
-                raise FileNotFoundError(f"No .xml found in OpenVINO dir: {model_path}")
-            model_load_path = xmls[0]
-        if self.is_openvino:
-            print(f"[BasketballTracker] Using OpenVINO IR model: {model_load_path}")
-        else:
-            print(f"[BasketballTracker] Using model: {model_load_path}")
-        self.model = YOLO(model_load_path)
-
-        if config_path is None:
-            config_path = os.path.join(os.path.dirname(__file__), "basketball_bytetrack.yaml")
-        with open(config_path, "r") as f:
-            cfg = yaml.safe_load(f)
-
-        # BYTETrack-like thresholds
-        self.match_thresh: float = float(cfg.get("match_thresh", 0.8))
-        self.new_track_thresh: float = float(cfg.get("new_track_thresh", 0.6))
-        self.proximity_thresh: float = float(cfg.get("proximity_thresh", 0.5))
-        self.track_buffer: int = int(cfg.get("track_buffer", 40))
-        self.track_high_thresh: float = float(cfg.get("track_high_thresh", 0.5))
-        self.track_low_thresh: float = float(cfg.get("track_low_thresh", 0.1))
-
-        # trackers per class
-        self.next_id = 1
-        self.tracks: Dict[str, List[Track]] = {
-            "person": [],
-            "sports ball": [],
-        }
-        self.class_map = {0: "person", 32: "sports ball"}  # COCO ids commonly
-        self.t_last = time.time()
-
-    @staticmethod
-    def _iou(b1: np.ndarray, b2: np.ndarray) -> float:
-        x1 = max(b1[0], b2[0])
-        y1 = max(b1[1], b2[1])
-        x2 = min(b1[2], b2[2])
-        y2 = min(b1[3], b2[3])
-        inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-        a1 = max(0.0, b1[2] - b1[0]) * max(0.0, b1[3] - b1[1])
-        a2 = max(0.0, b2[2] - b2[0]) * max(0.0, b2[3] - b2[1])
-        union = a1 + a2 - inter + 1e-6
-        return float(inter / union)
-
-    @staticmethod
-    def _centroid(b: np.ndarray) -> Tuple[float, float]:
-        return float((b[0] + b[2]) / 2.0), float((b[1] + b[3]) / 2.0)
-
-    def _assign(self, tracks: List[Track], dets: np.ndarray, iou_thresh: float) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
-        """Greedy IoU matching to avoid SciPy dependency.
-        Returns (matches, unmatched_track_indices, unmatched_det_indices).
+        model_path: str,
+        device: DeviceType,
+        high_thresh: float = 0.6,
+        low_thresh: float = 0.1,
+        match_thresh: float = 0.3,  # Lower IoU threshold for better association
+        max_time_lost: int = 30
+    ):
         """
-        if len(tracks) == 0 or len(dets) == 0:
-            return [], list(range(len(tracks))), list(range(len(dets)))
-        T = len(tracks)
-        D = len(dets)
-        ious = np.zeros((T, D), dtype=np.float32)
-        for i, tr in enumerate(tracks):
-            for j in range(D):
-                ious[i, j] = self._iou(tr.bbox, dets[j, :4])
-        matched_t = set()
-        matched_d = set()
-        matches: List[Tuple[int, int]] = []
-        while True:
-            best_iou = -1.0
-            best = (-1, -1)
-            for i in range(T):
-                if i in matched_t:
-                    continue
-                for j in range(D):
-                    if j in matched_d:
-                        continue
-                    v = float(ious[i, j])
-                    if v > best_iou:
-                        best_iou = v
-                        best = (i, j)
-            if best_iou < iou_thresh or best[0] == -1:
-                break
-            i, j = best
-            matches.append((i, j))
-            matched_t.add(i)
-            matched_d.add(j)
-        unmatched_t = [i for i in range(T) if i not in matched_t]
-        unmatched_d = [j for j in range(D) if j not in matched_d]
-        return matches, unmatched_t, unmatched_d
+        Initialize Basketball Tracker
+        
+        Args:
+            model_path: Path to OpenVINO IR model (.xml file)
+            device: OpenVINO device type
+            high_thresh: High confidence threshold for first association
+            low_thresh: Low confidence threshold for second association  
+            match_thresh: IoU threshold for track association
+            max_time_lost: Maximum frames to keep lost tracks
+        """
+        self.model_path = Path(model_path)
+        self.device = device
+        self.high_thresh = high_thresh
+        self.low_thresh = low_thresh
+        self.match_thresh = match_thresh
+        self.max_time_lost = max_time_lost
+        
+        # Initialize OpenVINO
+        self._init_openvino()
+        
+        # BYTETrack state
+        self.tracks: List[Track] = []
+        self.track_id_counter = 0
+        self.frame_count = 0
+        
+        logger.info(f"BasketballTracker initialized with device: {device.value}")
+    
+    def _init_openvino(self):
+        """Initialize OpenVINO Core and compile model"""
+        try:
+            # Initialize OpenVINO Core
+            self.core = ov.Core()
+            
+            # Read model
+            logger.info(f"Loading model from: {self.model_path}")
+            self.model = self.core.read_model(self.model_path)
+            
+            # Compile model
+            self.compiled_model = self.core.compile_model(
+                model=self.model, 
+                device_name=self.device.value
+            )
+            
+            # Get input/output info
+            self.input_layer = self.compiled_model.input(0)
+            self.output_layer = self.compiled_model.output(0)
+            
+            # Get input shape
+            self.input_shape = self.input_layer.shape
+            self.input_height = self.input_shape[2]
+            self.input_width = self.input_shape[3]
+            
+            logger.info(f"Model loaded successfully. Input shape: {self.input_shape}")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenVINO: {e}")
+            raise
+    
+    def preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Preprocess frame for model inference
+        
+        Args:
+            frame: Input BGR frame
+            
+        Returns:
+            Preprocessed tensor ready for inference
+        """
+        # Convert BGR to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Resize to model input size
+        resized = cv2.resize(rgb_frame, (self.input_width, self.input_height))
+        
+        # Normalize to [0, 1]
+        normalized = resized.astype(np.float32) / 255.0
+        
+        # Add batch dimension and transpose to NCHW
+        input_tensor = np.transpose(normalized, (2, 0, 1))
+        input_tensor = np.expand_dims(input_tensor, axis=0)
+        
+        return input_tensor
+    
+    def postprocess_detections(
+        self, 
+        outputs: np.ndarray, 
+        frame_shape: Tuple[int, int]
+    ) -> List[Detection]:
+        """
+        Postprocess model outputs to extract basketball detections
+        
+        Args:
+            outputs: Raw model outputs
+            frame_shape: Original frame shape (height, width)
+            
+        Returns:
+            List of basketball detections
+        """
+        detections = []
+        frame_height, frame_width = frame_shape
+        
+        # Scale factors for bbox coordinates
+        scale_x = frame_width / self.input_width
+        scale_y = frame_height / self.input_height
+        
+        # Process outputs (YOLOv8 format handling)
+        logger.info(f"Raw outputs shape: {outputs.shape}")
+        
+        # Handle YOLOv8 output format: [1, 5, 3549] -> [1, 5, num_anchors]
+        # Format: [x_center, y_center, width, height, confidence]
+        if len(outputs.shape) == 3:
+            batch_size, num_classes_plus_coords, num_anchors = outputs.shape
+            outputs = outputs[0]  # Remove batch dimension: [5, 3549]
+            
+            # Transpose to [num_anchors, 5]
+            outputs = outputs.transpose()  # [3549, 5]
+        
+        logger.info(f"Processing outputs shape: {outputs.shape}")
+        
+        # Process detections in YOLOv8 format
+        for i, detection in enumerate(outputs):
+            if len(detection) >= 5:
+                x_center, y_center, width, height, conf = detection[:5]
+                
+                # Debug: log first few detections
+                if i < 5:
+                    logger.info(f"Raw detection {i}: x_center={x_center:.3f}, y_center={y_center:.3f}, w={width:.3f}, h={height:.3f}, conf={conf:.3f}")
+                
+                # Apply sigmoid to confidence if needed (values > 1 suggest raw logits)
+                if conf > 1.0:
+                    conf = 1.0 / (1.0 + np.exp(-conf))  # Sigmoid activation
+                
+                # Filter by confidence
+                if conf >= 0.25:  # Lower threshold for better detection
+                    # Convert center format to corner format
+                    x1 = (x_center - width / 2) * scale_x
+                    y1 = (y_center - height / 2) * scale_y
+                    x2 = (x_center + width / 2) * scale_x
+                    y2 = (y_center + height / 2) * scale_y
+                    
+                    # Clamp to frame boundaries
+                    x1 = max(0, min(x1, frame_width))
+                    y1 = max(0, min(y1, frame_height))
+                    x2 = max(0, min(x2, frame_width))
+                    y2 = max(0, min(y2, frame_height))
+                    
+                    # Ensure valid bounding box
+                    if x2 > x1 and y2 > y1:
+                        detections.append(Detection(
+                            bbox=(x1, y1, x2, y2),
+                            confidence=float(conf),
+                            class_id=0  # Assume basketball class
+                        ))
+        
+        return detections
+    
+    def calculate_iou(self, bbox1: Tuple[float, float, float, float], 
+                     bbox2: Tuple[float, float, float, float]) -> float:
+        """Calculate IoU between two bounding boxes"""
+        x1_1, y1_1, x2_1, y2_1 = bbox1
+        x1_2, y1_2, x2_2, y2_2 = bbox2
+        
+        # Calculate intersection
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        
+        # Calculate union
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def associate_detections_to_tracks(
+        self, 
+        detections: List[Detection], 
+        tracks: List[Track],
+        iou_threshold: float
+    ) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+        """
+        Associate detections to tracks using Hungarian algorithm
+        
+        Returns:
+            matches: List of (track_idx, detection_idx) pairs
+            unmatched_tracks: List of unmatched track indices
+            unmatched_detections: List of unmatched detection indices
+        """
+        if len(tracks) == 0:
+            return [], [], list(range(len(detections)))
+        
+        if len(detections) == 0:
+            return [], list(range(len(tracks))), []
+        
+        # Calculate IoU matrix
+        iou_matrix = np.zeros((len(tracks), len(detections)))
+        for t, track in enumerate(tracks):
+            for d, detection in enumerate(detections):
+                iou_matrix[t, d] = self.calculate_iou(track.bbox, detection.bbox)
+        
+        # Improved greedy matching with better association logic
+        matches = []
+        unmatched_tracks = list(range(len(tracks)))
+        unmatched_detections = list(range(len(detections)))
+        
+        # Sort potential matches by IoU score (highest first)
+        potential_matches = []
+        for t in range(len(tracks)):
+            for d in range(len(detections)):
+                if iou_matrix[t, d] >= iou_threshold:
+                    potential_matches.append((iou_matrix[t, d], t, d))
+        
+        # Sort by IoU score descending
+        potential_matches.sort(reverse=True)
+        
+        # Assign matches greedily, starting with highest IoU
+        for iou_score, t, d in potential_matches:
+            if t in unmatched_tracks and d in unmatched_detections:
+                matches.append((t, d))
+                unmatched_tracks.remove(t)
+                unmatched_detections.remove(d)
+        
+        return matches, unmatched_tracks, unmatched_detections
+    
+    def update_tracks(self, detections: List[Detection]) -> List[Track]:
+        """
+        Update tracks using BYTETrack algorithm
+        
+        Args:
+            detections: List of basketball detections
+            
+        Returns:
+            List of active tracks
+        """
+        self.frame_count += 1
+        
+        # Separate high and low confidence detections
+        high_conf_dets = [d for d in detections if d.confidence >= self.high_thresh]
+        low_conf_dets = [d for d in detections if self.low_thresh <= d.confidence < self.high_thresh]
+        
+        # Predict track positions using Kalman filter
+        for track in self.tracks:
+            if track.kalman_filter and track.kalman_filter.initialized:
+                try:
+                    predicted_pos = track.kalman_filter.predict()
+                    if predicted_pos is not None and len(predicted_pos) >= 2:
+                        # Update bbox center based on prediction
+                        cx, cy = predicted_pos[0], predicted_pos[1]
+                        w = track.bbox[2] - track.bbox[0]
+                        h = track.bbox[3] - track.bbox[1]
+                        track.bbox = (cx - w/2, cy - h/2, cx + w/2, cy + h/2)
+                except:
+                    pass  # Continue with previous bbox if prediction fails
+        
+        # Stage 1: Associate high-confidence detections with active tracks
+        active_tracks = [t for t in self.tracks if t.state == "active"]
+        matches, unmatched_tracks, unmatched_high_dets = self.associate_detections_to_tracks(
+            high_conf_dets, active_tracks, self.match_thresh
+        )
+        
+        # Update matched tracks
+        for track_idx, det_idx in matches:
+            track = active_tracks[track_idx]
+            detection = high_conf_dets[det_idx]
+            
+            track.bbox = detection.bbox
+            track.confidence = detection.confidence
+            track.hits += 1
+            track.time_since_update = 0
+            
+            # Update Kalman filter
+            if track.kalman_filter and track.kalman_filter.initialized:
+                try:
+                    cx = (detection.bbox[0] + detection.bbox[2]) / 2
+                    cy = (detection.bbox[1] + detection.bbox[3]) / 2
+                    track.kalman_filter.update(np.array([cx, cy]))
+                except:
+                    pass
+        
+        # Stage 2: Associate remaining high-confidence detections with lost tracks
+        lost_tracks = [t for t in self.tracks if t.state == "lost"]
+        remaining_high_dets = [high_conf_dets[i] for i in unmatched_high_dets]
+        
+        if lost_tracks and remaining_high_dets:
+            matches2, unmatched_lost_tracks, unmatched_high_dets2 = self.associate_detections_to_tracks(
+                remaining_high_dets, lost_tracks, self.match_thresh * 0.7  # More lenient for lost tracks
+            )
+            
+            # Reactivate matched lost tracks
+            for track_idx, det_idx in matches2:
+                track = lost_tracks[track_idx]
+                detection = remaining_high_dets[det_idx]
+                
+                track.bbox = detection.bbox
+                track.confidence = detection.confidence
+                track.state = "active"
+                track.hits += 1
+                track.time_since_update = 0
+            
+            unmatched_high_dets = [unmatched_high_dets[i] for i in unmatched_high_dets2]
+        
+        # Stage 3: Associate low-confidence detections with unmatched tracks
+        all_unmatched_tracks = []
+        for i in unmatched_tracks:
+            all_unmatched_tracks.append(active_tracks[i])
+        
+        if all_unmatched_tracks and low_conf_dets:
+            matches3, _, _ = self.associate_detections_to_tracks(
+                low_conf_dets, all_unmatched_tracks, self.match_thresh * 0.4  # Even more lenient for low confidence
+            )
+            
+            # Update matched tracks with low-confidence detections
+            for track_idx, det_idx in matches3:
+                track = all_unmatched_tracks[track_idx]
+                detection = low_conf_dets[det_idx]
+                
+                track.bbox = detection.bbox
+                track.confidence = detection.confidence
+                track.hits += 1
+                track.time_since_update = 0
+        
+        # Create new tracks for unmatched high-confidence detections
+        for det_idx in unmatched_high_dets:
+            detection = high_conf_dets[det_idx]
+            new_track = Track(
+                track_id=self.track_id_counter,
+                bbox=detection.bbox,
+                confidence=detection.confidence,
+                hits=1
+            )
+            self.tracks.append(new_track)
+            self.track_id_counter += 1
+        
+        # Update track states and remove old tracks
+        for track in self.tracks[:]:
+            track.age += 1
+            if track.time_since_update == 0:
+                continue
+            
+            track.time_since_update += 1
+            
+            if track.state == "active" and track.time_since_update > 1:
+                track.state = "lost"
+            elif track.time_since_update > self.max_time_lost:
+                self.tracks.remove(track)
+        
+        # Return active tracks
+        return [t for t in self.tracks if t.state == "active"]
+    
+    def infer_frame(self, frame: np.ndarray) -> Tuple[List[Track], np.ndarray]:
+        """
+        Run inference on a single frame
+        
+        Args:
+            frame: Input BGR frame
+            
+        Returns:
+            Tuple of (active_tracks, annotated_frame)
+        """
+        # Preprocess frame
+        input_tensor = self.preprocess_frame(frame)
+        
+        # Run inference
+        try:
+            results = self.compiled_model([input_tensor])
+            outputs = results[self.output_layer]
+            logger.info(f"Inference output shape: {outputs.shape}")
+        except Exception as e:
+            logger.error(f"Inference failed: {e}")
+            return [], frame
+        
+        # Postprocess detections
+        detections = self.postprocess_detections(outputs, frame.shape[:2])
+        logger.info(f"Found {len(detections)} detections")
+        
+        # Debug: print detection details
+        for i, det in enumerate(detections):
+            logger.info(f"Detection {i}: bbox={det.bbox}, conf={det.confidence:.3f}, class={det.class_id}")
+        
+        # Update tracks
+        active_tracks = self.update_tracks(detections)
+        logger.info(f"Active tracks: {len(active_tracks)}")
+        
+        # Draw clean annotations without trails
+        annotated_frame = self.draw_clean_tracks(frame.copy(), active_tracks)
+        
+        return active_tracks, annotated_frame
+    
+    def draw_tracks(self, frame: np.ndarray, tracks: List[Track]) -> np.ndarray:
+        """Draw track bounding boxes and IDs on frame"""
+        for track in tracks:
+            x1, y1, x2, y2 = map(int, track.bbox)
+            
+            # Draw bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Draw track ID and confidence
+            label = f"ID:{track.track_id} ({track.confidence:.2f})"
+            cv2.putText(frame, label, (x1, y1 - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        return frame
+    
+    def draw_clean_tracks(self, frame: np.ndarray, tracks: List[Track]) -> np.ndarray:
+        """Draw only current active tracks without trails or history"""
+        # Ensure we're working with a fresh copy of the frame
+        clean_frame = frame.copy()
+        
+        # Draw only active tracks with clean bounding boxes
+        for track in tracks:
+            x1, y1, x2, y2 = map(int, track.bbox)
+            
+            # Ensure coordinates are valid
+            if x2 > x1 and y2 > y1:
+                # Draw clean bounding box in green
+                cv2.rectangle(clean_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                # Draw track ID and confidence with background for better visibility
+                label = f"Basketball ID:{track.track_id}"
+                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                
+                # Draw background rectangle for text
+                cv2.rectangle(clean_frame, (x1, y1 - label_size[1] - 10), 
+                             (x1 + label_size[0], y1), (0, 255, 0), -1)
+                
+                # Draw text
+                cv2.putText(clean_frame, label, (x1, y1 - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        
+        return clean_frame
+    
+    def draw_tracks_and_detections(self, frame: np.ndarray, tracks: List[Track], detections: List[Detection]) -> np.ndarray:
+        """Draw both tracks and raw detections for debugging (kept for compatibility)"""
+        return self.draw_clean_tracks(frame, tracks)
+    
+    def get_device_info(self) -> Dict[str, Any]:
+        """Get OpenVINO device information"""
+        try:
+            available_devices = self.core.available_devices
+            device_info = {
+                "available_devices": available_devices,
+                "current_device": self.device.value,
+                "model_path": str(self.model_path),
+                "input_shape": self.input_shape
+            }
+            return device_info
+        except Exception as e:
+            logger.error(f"Failed to get device info: {e}")
+            return {}
 
-    def _update_class_tracks(self, cls_name: str, high_dets: np.ndarray, low_dets: np.ndarray) -> None:
-        # Stage 1: match high-confidence dets
-        tracks = self.tracks[cls_name]
-        matches, unmatched_t, unmatched_d = self._assign(tracks, high_dets, self.match_thresh)
-        for ti, dj in matches:
-            bbox = high_dets[dj, :4]
-            score = float(high_dets[dj, 4])
-            tracks[ti].update(bbox, score)
-        # Stage 2: match remaining tracks with low-confidence dets
-        if len(unmatched_t) > 0 and len(low_dets) > 0:
-            rem_tracks = [tracks[i] for i in unmatched_t]
-            m2, rem_t_idx, rem_d_idx = self._assign(rem_tracks, low_dets, self.proximity_thresh)
-            # map back track indices
-            for (rt_i, dj) in m2:
-                ti = unmatched_t[rt_i]
-                bbox = low_dets[dj, :4]
-                score = float(low_dets[dj, 4])
-                tracks[ti].update(bbox, score)
-                unmatched_t.remove(ti)
-        # Create new tracks from unmatched high_dets above new_track_thresh
-        for dj in unmatched_d:
-            conf = float(high_dets[dj, 4])
-            if conf >= self.new_track_thresh:
-                bbox = high_dets[dj, :4]
-                tr = Track(id=self.next_id, bbox=bbox, score=conf, cls=cls_name)
-                self.next_id += 1
-                tracks.append(tr)
-        # Age unmatched tracks and prune
-        still = []
-        for idx, tr in enumerate(tracks):
-            if all(idx != ti for ti, _ in matches):
-                tr.time_since_update += 1
-            if tr.time_since_update <= self.track_buffer:
-                still.append(tr)
-        self.tracks[cls_name] = still
 
-    def _split_by_conf(self, dets: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        if dets.size == 0:
-            return dets, dets
-        confs = dets[:, 4]
-        high = dets[confs >= self.track_high_thresh]
-        low = dets[(confs < self.track_high_thresh) & (confs >= self.track_low_thresh)]
-        return high, low
-
-    def infer_frame(self, frame: np.ndarray, conf: Optional[float] = None) -> Tuple[np.ndarray, dict]:
-        t0 = time.time()
-        det_conf = float(conf) if conf is not None else float(self.track_low_thresh)
-        results = self.model.predict(source=frame, conf=det_conf, verbose=False, device=self.device)
-        r = results[0]
-        boxes = r.boxes
-        det_xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes, "xyxy") else np.zeros((0, 4), dtype=np.float32)
-        det_conf_arr = boxes.conf.cpu().numpy() if hasattr(boxes, "conf") else np.zeros((0,), dtype=np.float32)
-        det_cls_arr = boxes.cls.cpu().numpy().astype(int) if hasattr(boxes, "cls") else np.zeros((0,), dtype=int)
-
-        # Split detections by class (person, sports ball)
-        per_mask = det_cls_arr == 0
-        ball_mask = det_cls_arr == 32
-        per_dets = np.hstack([det_xyxy[per_mask], det_conf_arr[per_mask, None]]) if det_xyxy.size else np.zeros((0,5), dtype=np.float32)
-        ball_dets = np.hstack([det_xyxy[ball_mask], det_conf_arr[ball_mask, None]]) if det_xyxy.size else np.zeros((0,5), dtype=np.float32)
-
-        per_high, per_low = self._split_by_conf(per_dets)
-        ball_high, ball_low = self._split_by_conf(ball_dets)
-
-        # Update trackers
-        self._update_class_tracks("person", per_high, per_low)
-        self._update_class_tracks("sports ball", ball_high, ball_low)
-
-        # Build annotation
-        annotated = frame.copy()
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        for cls_name, tracks in self.tracks.items():
-            color = (0, 255, 0) if cls_name == "person" else (0, 165, 255)
-            for tr in tracks:
-                x1, y1, x2, y2 = tr.bbox.astype(int)
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(annotated, f"{cls_name[:6]}#{tr.id}", (x1, max(0, y1-6)), font, 0.5, color, 1, cv2.LINE_AA)
-
-        # Build meta
-        meta_objects = []
-        out_tracks = {"person": [], "sports ball": []}
-        for cls_name, tracks in self.tracks.items():
-            for tr in tracks:
-                o = {
-                    "id": int(tr.id),
-                    "cls": cls_name,
-                    "bbox": [float(v) for v in tr.bbox.tolist()],
-                    "score": float(tr.score),
-                }
-                meta_objects.append(o)
-                out_tracks[cls_name].append({"id": int(tr.id), "bbox": o["bbox"], "score": o["score"]})
-
-        t1 = time.time()
-        fps = 1.0 / max(1e-6, (t1 - self.t_last))
-        self.t_last = t1
-        meta = {
-            "conf": det_conf,
-            "fps": float(fps),
-            "objects": meta_objects,
-            "tracks": out_tracks,
-        }
-        return annotated, meta
+# Optimized Basketball Model class for compatibility with existing Flet UI
+class OptimizedBasketballModel:
+    """Wrapper class for compatibility with existing UI code"""
+    
+    def __init__(self, model_path: str, device: str = "CPU"):
+        device_enum = DeviceType(device.upper())
+        self.tracker = BasketballTracker(model_path, device_enum)
+    
+    def infer_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Infer frame and return annotated result"""
+        _, annotated_frame = self.tracker.infer_frame(frame)
+        return annotated_frame
+    
+    def get_tracks(self, frame: np.ndarray) -> List[Track]:
+        """Get active tracks for a frame"""
+        tracks, _ = self.tracker.infer_frame(frame)
+        return tracks
 
 
-__all__ = ["BasketballTracker", "Track"]
+if __name__ == "__main__":
+    # Example usage
+    model_path = "models/ov_models/basketballModel_openvino_model/basketballModel.xml"
+    tracker = BasketballTracker(model_path, DeviceType.CPU)
+    
+    # Process video
+    cap = cv2.VideoCapture("./data/video/dribbling.mov")  # or video file path
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        tracks, annotated_frame = tracker.infer_frame(frame)
+        
+        cv2.imshow("Basketball Tracking", annotated_frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
