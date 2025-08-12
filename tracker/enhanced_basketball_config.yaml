@@ -1,0 +1,71 @@
+# Enhanced Basketball Tracking Configuration
+# Optimized for handling occlusion during dribbling scenarios
+
+# Detection thresholds
+detection:
+  high_thresh: 0.6      # High confidence threshold (reduced from 0.7)
+  low_thresh: 0.1       # Low confidence threshold (reduced from 0.3)
+  nms_thresh: 0.7       # NMS threshold (increased to keep more detections)
+
+# Tracking parameters
+tracking:
+  # Track lifecycle
+  track_buffer: 60      # Frames to keep lost tracks (increased from 30)
+  frame_rate: 30        # Video frame rate
+  
+  # Association thresholds
+  match_thresh: 0.8     # High confidence detection matching (relaxed from 0.9)
+  second_match_thresh: 0.5  # Low confidence detection matching (relaxed from 0.7)
+  unconfirmed_match_thresh: 0.7  # Unconfirmed track matching
+  
+  # Track confirmation
+  min_box_area: 10      # Minimum detection area (reduced)
+  track_high_thresh: 0.6  # Threshold for high confidence tracks
+  track_low_thresh: 0.1   # Threshold for low confidence tracks
+  new_track_thresh: 0.7   # Threshold for creating new tracks (reduced)
+
+# Enhanced Kalman Filter settings
+kalman:
+  dt: 1.0               # Time step (frames)
+  gravity: 2.0          # Gravity factor (pixels/frame^2, adjusted for basketball)
+  max_occlusion_frames: 15  # Maximum frames to predict during occlusion (increased)
+  
+  # Motion phase adaptation
+  normal_noise: 1.0
+  bouncing_noise: 3.0
+  fast_motion_noise: 2.0
+  
+  # Confidence-based updates
+  min_confidence_update: 0.3  # Minimum confidence to update filter
+  confidence_scaling: True    # Scale measurement noise by confidence
+
+# Occlusion handling
+occlusion:
+  enable_prediction: True     # Enable prediction during occlusion
+  max_prediction_frames: 15   # Maximum frames to predict without detection
+  confidence_decay: 0.95      # Confidence decay per frame during occlusion
+  reappearance_thresh: 0.4    # Threshold for track reappearance
+  
+  # Trajectory analysis
+  history_length: 10          # Number of positions to keep in history
+  motion_analysis: True       # Enable motion phase analysis
+  
+# Basketball-specific settings
+basketball:
+  # Expected motion characteristics
+  max_speed: 50.0            # Maximum expected speed (pixels/frame)
+  typical_size_range: [10, 100]  # Typical basketball size range (pixels)
+  
+  # Dribbling detection
+  detect_dribbling: True      # Enable dribbling pattern detection
+  bounce_detection_thresh: 30 # Threshold for bounce detection
+  
+  # Court constraints (optional, set to null to disable)
+  court_bounds: null          # [x_min, y_min, x_max, y_max] or null
+  
+# Debugging and visualization
+debug:
+  enable_logging: True
+  log_level: "INFO"          # DEBUG, INFO, WARNING, ERROR
+  save_trajectories: False   # Save trajectory data for analysis
+  visualize_predictions: True # Show predicted positions during occlusion

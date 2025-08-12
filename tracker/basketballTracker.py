@@ -19,6 +19,7 @@ import time
 try:
     from .utils.byte_track import BYTETracker, STrack
     from .utils.KalmanFilter import BasketballKalmanFilter
+    from .utils.EnhancedKalmanFilter import EnhancedBasketballKalmanFilter
     from .utils.drawing import draw_basketball_track, draw_detection_info
     from .utils.matching import calculate_iou
     from .utils.openvino_utils import (
@@ -28,6 +29,7 @@ try:
 except ImportError:
     from utils.byte_track import BYTETracker, STrack
     from utils.KalmanFilter import BasketballKalmanFilter
+    from utils.EnhancedKalmanFilter import EnhancedBasketballKalmanFilter
     from utils.drawing import draw_basketball_track, draw_detection_info
     from utils.matching import calculate_iou
     from utils.openvino_utils import (
