@@ -15,3 +15,7 @@ An AI-assisted toolkit to analyze basketball video, detect the ball and players,
 ## Install the basics:
 ```bash
 pip install -r requirements.txt
+```
+
+### Model Link:
+https://drive.google.com/drive/folders/1pwZrCnAAC32OwL0ffWlkGQDtJnaZ_GX3?usp=drive_link
