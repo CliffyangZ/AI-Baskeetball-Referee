@@ -78,7 +78,7 @@ class BasketballTracker:
         }
 
     def detect_basketballs(self, frame: np.ndarray) -> List[BasketballDetection]:
-        """Detect basketballs in frame"""
+        """Detect basketballs in frame - only returns the highest confidence detection"""
         # Preprocess frame
         input_tensor = self.inference_engine.preprocess_frame(frame)
         
@@ -97,58 +97,65 @@ class BasketballTracker:
             outputs = outputs.T
         
         # Process each detection
+        highest_confidence = self.low_thresh
+        best_detection = None
+        
         for detection in outputs:
             if len(detection) >= 5:
                 x_center, y_center, width, height, confidence = detection[:5]
                 
-                # Filter by low threshold
-                if confidence >= self.low_thresh:
+                # Only consider detections above threshold
+                if confidence >= self.low_thresh and confidence > highest_confidence:
+                    highest_confidence = confidence
+                    
                     # Convert to pixel coordinates
                     input_size = (self.inference_engine.input_width, self.inference_engine.input_height)
                     frame_size = (frame_width, frame_height)
                     
-                    # Simple coordinate conversion (you can use your normalize_coordinates function)
+                    # Simple coordinate conversion
                     x1 = max(0, min((x_center - width/2) * frame_width / input_size[0], frame_width))
                     y1 = max(0, min((y_center - height/2) * frame_height / input_size[1], frame_height))
                     x2 = max(0, min((x_center + width/2) * frame_width / input_size[0], frame_width))
                     y2 = max(0, min((y_center + height/2) * frame_height / input_size[1], frame_height))
                     
-                    basketball_detection = BasketballDetection(
+                    best_detection = BasketballDetection(
                         bbox=(x1, y1, x2, y2),
                         confidence=float(confidence)
                     )
-                    detections.append(basketball_detection)
-
-        # Apply Non-Maximum Suppression to remove duplicate detections
-        detections = apply_nms(detections, iou_threshold=self.config['detection']['nms_thresh'])
+        
+        # Only return the highest confidence detection
+        if best_detection:
+            detections = [best_detection]
+            logger.debug(f"Tracking highest confidence ball: {highest_confidence:.2f}")
         
         return detections
     
     def track_frame(self, frame: np.ndarray) -> Tuple[List[dict], np.ndarray]:
         """
-        Track basketballs in frame with enhanced occlusion handling
+        Track the highest confidence basketball in frame
         
         Returns:
             Tuple of (tracks_info, annotated_frame)
         """
-        # Detect basketballs
+        # Detect basketballs - only the highest confidence one
         detections = self.detect_basketballs(frame)
         
         # Enhanced tracking logic
         tracks_info = []
         annotated_frame = frame.copy()
         
-        # Simple association for demo (you can integrate with ByteTrack)
-        for detection in detections:
+        # We'll use a single track ID for the main basketball
+        main_track_id = 0
+        
+        # Process the highest confidence detection (if any)
+        if detections:
+            detection = detections[0]  # Only one detection (highest confidence)
             center = detection.center
             confidence = detection.confidence
             
-            # Find closest existing track or create new one
-            track_id = self._associate_detection(center, confidence)
-            
             # Update Kalman filter
-            if track_id in self.kalman_filters:
-                kf = self.kalman_filters[track_id]
+            if main_track_id in self.kalman_filters:
+                kf = self.kalman_filters[main_track_id]
                 kf.update(np.array(center), confidence)
             else:
                 # Create new track
@@ -157,13 +164,13 @@ class BasketballTracker:
                     gravity=self.config['kalman']['gravity']
                 )
                 kf.initialize(np.array(center))
-                self.kalman_filters[track_id] = kf
+                self.kalman_filters[main_track_id] = kf
             
             # Get motion info
             motion_info = kf.get_motion_info()
             
             tracks_info.append({
-                'track_id': track_id,
+                'track_id': main_track_id,
                 'bbox': detection.bbox,
                 'center': center,
                 'confidence': confidence,
@@ -171,53 +178,48 @@ class BasketballTracker:
             })
             
             # Draw on frame
-            self._draw_track(annotated_frame, detection, track_id, motion_info)
-        
-        # Predict for occluded tracks
-        self._predict_occluded_tracks(annotated_frame, tracks_info)
+            self._draw_track(annotated_frame, detection, main_track_id, motion_info)
+        elif main_track_id in self.kalman_filters:
+            # No detection but we have an existing track - predict its position
+            kf = self.kalman_filters[main_track_id]
+            kf.predict()
+            
+            # Get predicted position
+            state = kf.get_state()
+            predicted_pos = (state[0], state[1])
+            
+            # Get motion info
+            motion_info = kf.get_motion_info()
+            motion_info['occlusion_frames'] = motion_info.get('occlusion_frames', 0) + 1
+            
+            # Only keep track if not occluded for too long
+            if motion_info['occlusion_frames'] <= self.max_occlusion_frames:
+                tracks_info.append({
+                    'track_id': main_track_id,
+                    'bbox': None,
+                    'center': predicted_pos,
+                    'confidence': 0.5,  # Lower confidence for predicted position
+                    'motion_info': motion_info
+                })
+                
+                # Draw predicted position
+                self._draw_predicted_track(annotated_frame, predicted_pos, main_track_id, motion_info)
+            else:
+                # Reset tracking if occluded for too long
+                del self.kalman_filters[main_track_id]
         
         return tracks_info, annotated_frame
     
     def _associate_detection(self, center: Tuple[float, float], confidence: float) -> int:
-        """Simple detection association (can be improved with Hungarian algorithm)"""
-        min_distance = float('inf')
-        best_track_id = None
-        
-        for track_id, kf in self.kalman_filters.items():
-            if kf.can_predict_during_occlusion():
-                predicted_pos = kf.get_position()
-                if predicted_pos:
-                    distance = np.linalg.norm(np.array(center) - np.array(predicted_pos))
-                    if distance < min_distance and distance < 50:  # Distance threshold
-                        min_distance = distance
-                        best_track_id = track_id
-        
-        if best_track_id is None:
-            # Create new track
-            self.track_id_counter += 1
-            best_track_id = self.track_id_counter
-        
-        return best_track_id
+        """Simple detection association - always returns track ID 0 for single ball tracking"""
+        # We're only tracking one ball, so always use ID 0
+        return 0
     
     def _predict_occluded_tracks(self, frame: np.ndarray, active_tracks: List[dict]):
-        """Predict positions for occluded tracks"""
-        active_track_ids = {track['track_id'] for track in active_tracks}
-        
-        for track_id, kf in list(self.kalman_filters.items()):
-            if track_id not in active_track_ids:
-                # This track is occluded, try to predict
-                if kf.can_predict_during_occlusion():
-                    predicted_state = kf.predict()
-                    if predicted_state is not None:
-                        predicted_pos = (predicted_state[0], predicted_state[1])
-                        motion_info = kf.get_motion_info()
-                        
-                        # Draw predicted position
-                        #self._draw_predicted_track(frame, predicted_pos, track_id, motion_info)
-                else:
-                    # Remove track if too long without detection
-                    logger.debug(f"Removing track {track_id} after long occlusion")
-                    del self.kalman_filters[track_id]
+        """Predict positions for occluded tracks - simplified for single ball tracking"""
+        # Since we're only tracking one ball and handling occlusion in track_frame,
+        # this method is now simplified
+        pass
     
     def _draw_track(self, frame: np.ndarray, detection: BasketballDetection, 
                    track_id: int, motion_info: dict):
