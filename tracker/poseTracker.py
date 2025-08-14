@@ -15,12 +15,17 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 import time
+import sys
+import os
+
+# Add project root to path to fix imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import utilities
 # Import directly from project root utils
-from utils.image_utils import bgr_to_rgb, frame_to_base64_png
-from utils.matching import calculate_iou
-from utils.openvino_utils import (
+from tracker.utils.image_utils import bgr_to_rgb, frame_to_base64_png
+from tracker.utils.algorithm import calculate_iou
+from tracker.utils.openvino_utils import (
     DeviceType, OpenVINOInferenceEngine, FPSCounter, 
     normalize_coordinates, ensure_frame_bounds, BaseOptimizedModel
 )
