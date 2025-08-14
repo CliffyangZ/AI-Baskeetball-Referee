@@ -184,3 +184,86 @@ def draw_detection_info(frame: np.ndarray,
         frame = draw_text_label(frame, fps_text, (10, 90), (255, 255, 255))
     
     return frame
+
+
+def draw_hoop_detection(frame: np.ndarray, detection, hoop_id: int) -> np.ndarray:
+    """
+    Draw single hoop detection on frame
+    
+    Args:
+        frame: Input frame
+        detection: HoopDetection object
+        hoop_id: Hoop ID number
+        
+    Returns:
+        Frame with drawn hoop detection
+    """
+    x1, y1, x2, y2 = map(int, detection.bbox)
+    
+    # Colors for hoop detection
+    box_color = (255, 0, 0)  # Blue for hoop
+    center_color = (255, 0, 0)
+    rim_color = (0, 0, 255)  # Red for rim center
+    
+    # Draw bounding box
+    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+    
+    # Draw center point
+    center_x, center_y = map(int, detection.center)
+    cv2.circle(frame, (center_x, center_y), 5, center_color, -1)
+    
+    # Draw rim center
+    rim_x, rim_y = map(int, detection.rim_center)
+    cv2.circle(frame, (rim_x, rim_y), 3, rim_color, -1)
+    
+    # Draw labels
+    label = f"Hoop {hoop_id}: {detection.confidence:.2f}"
+    cv2.putText(frame, label, (x1, y1 - 10), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+    
+    # Draw rim coordinates
+    coord_label = f"Rim: ({rim_x}, {rim_y})"
+    cv2.putText(frame, coord_label, (x1, y2 + 20), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.5, rim_color, 1)
+    
+    return frame
+
+
+def draw_hoop_detections(frame: np.ndarray, detections: List) -> np.ndarray:
+    """
+    Draw all hoop detections on frame
+    
+    Args:
+        frame: Input frame
+        detections: List of HoopDetection objects
+        
+    Returns:
+        Frame with all hoop detections drawn
+    """
+    for i, detection in enumerate(detections):
+        frame = draw_hoop_detection(frame, detection, i + 1)
+    
+    return frame
+
+
+def draw_frame_info(frame: np.ndarray, frame_count: int, detection_count: int) -> np.ndarray:
+    """
+    Draw frame information on frame
+    
+    Args:
+        frame: Input frame
+        frame_count: Current frame number
+        detection_count: Number of detections
+        
+    Returns:
+        Frame with info overlay
+    """
+    # Add frame counter
+    cv2.putText(frame, f"Frame: {frame_count}", (10, 30), 
+               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    
+    # Add detection count
+    cv2.putText(frame, f"Hoops: {detection_count}", (10, 70), 
+               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    
+    return frame

@@ -7,6 +7,40 @@ import numpy as np
 from typing import List, Tuple
 from scipy.optimize import linear_sum_assignment
 
+# Use generic types to avoid circular imports
+from typing import TypeVar, Any, Protocol
+
+class DetectionProtocol(Protocol):
+    bbox: Tuple[float, float, float, float]
+    confidence: float
+
+T = TypeVar('T', bound=DetectionProtocol)
+
+def apply_nms(detections: List[T], iou_threshold: float = 0.5) -> List[T]:
+        """Apply Non-Maximum Suppression to remove duplicate detections"""
+        if len(detections) <= 1:
+            return detections
+        
+        # Sort detections by confidence (highest first)
+        detections.sort(key=lambda x: x.confidence, reverse=True)
+        
+        # Apply NMS
+        keep_detections = []
+        while detections:
+            # Keep the detection with highest confidence
+            best_detection = detections.pop(0)
+            keep_detections.append(best_detection)
+            
+            # Remove detections with high IoU overlap
+            remaining_detections = []
+            for detection in detections:
+                iou = calculate_iou(best_detection.bbox, detection.bbox)
+                if iou <= iou_threshold:
+                    remaining_detections.append(detection)
+            
+            detections = remaining_detections
+        
+        return keep_detections
 
 def calculate_iou(bbox1: Tuple[float, float, float, float], 
                  bbox2: Tuple[float, float, float, float]) -> float:

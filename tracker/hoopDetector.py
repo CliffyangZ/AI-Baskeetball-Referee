@@ -1,8 +1,9 @@
 """
-Basketball Hoop Detector with OpenVINO Runtime Inference
+Basketball Hoop Detector with OpenVINO Runtime
 
 This module implements basketball hoop detection using OpenVINO for
 optimized inference, designed to work with the AI referee system.
+Focuses specifically on hoop detection, not basketball detection.
 """
 
 import numpy as np
@@ -13,12 +14,18 @@ from dataclasses import dataclass
 from enum import Enum
 import logging
 from pathlib import Path
+import sys
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import utilities
-from utils.image_utils import bgr_to_rgb, frame_to_base64_png
+from tracker.utils.drawing import draw_hoop_detections, draw_frame_info
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -32,11 +39,9 @@ class DeviceType(Enum):
 
 @dataclass
 class HoopDetection:
-    """Detection result for basketball objects (hoop or basketball)"""
+    """Detection result for basketball hoop"""
     bbox: Tuple[float, float, float, float]  # x1, y1, x2, y2
     confidence: float
-    class_id: int = 0  # 0=basketball, 1=hoop (or vice versa)
-    class_name: str = "unknown"  # "basketball" or "hoop"
     center: Tuple[float, float] = None  # center coordinates (x, y)
     rim_center: Tuple[float, float] = None  # estimated rim center
     
@@ -45,7 +50,7 @@ class HoopDetection:
         x1, y1, x2, y2 = self.bbox
         self.center = ((x1 + x2) / 2, (y1 + y2) / 2)
         # Rim is typically at the bottom center of the hoop detection
-        self.rim_center = ((x1 + x2) / 2, y2 - (y2 - y1) * 0.1)
+        self.rim_center = ((x1 + x2) / 2, y2 - (y2 - y1) * 0.15)
 
 
 class HoopDetector:
@@ -57,13 +62,14 @@ class HoopDetector:
     - Hoop coordinate extraction for AI referee
     - Configurable confidence threshold
     - Rim center estimation
+    - Focus on hoop detection only
     """
     
     def __init__(
         self,
         model_path: str,
-        device: DeviceType,
-        confidence_thresh: float = 0.1,
+        device: DeviceType = DeviceType.CPU,
+        confidence_thresh: float = 0.3,
         nms_thresh: float = 0.4
     ):
         """
@@ -88,6 +94,7 @@ class HoopDetector:
         self.last_hoops: List[HoopDetection] = []
         
         logger.info(f"HoopDetector initialized with device: {device.value}")
+        logger.info(f"Confidence threshold: {confidence_thresh}")
     
     def _init_openvino(self):
         """Initialize OpenVINO Core and compile model"""
@@ -164,67 +171,35 @@ class HoopDetector:
         detections = []
         frame_height, frame_width = frame_shape
         
-        # Debug: Print output shape and sample values
-        logger.debug(f"Raw output shape: {outputs.shape}")
-        logger.debug(f"Frame shape: {frame_shape}")
-        
         # Handle different output formats
         if len(outputs.shape) == 3:
             outputs = outputs[0]  # Remove batch dimension
-            logger.debug(f"After removing batch dim: {outputs.shape}")
         
-        # For YOLO models, outputs might be in format [num_detections, 85] where 85 = 4(bbox) + 1(conf) + 80(classes)
-        # Or it could be [8400, 85] for YOLOv8 format
-        
-        # Scale factors for converting back to original frame size
-        scale_x = frame_width / self.input_width
-        scale_y = frame_height / self.input_height
-        
-        logger.debug(f"Scale factors: x={scale_x:.2f}, y={scale_y:.2f}")
-        
-        # Check if we need to transpose (YOLOv8 format might be [85, 8400])
+        # Check if we need to transpose (YOLOv8 format might be [classes+4, detections])
         if outputs.shape[0] < outputs.shape[1] and outputs.shape[0] <= 85:
             outputs = outputs.T
-            logger.debug(f"Transposed output shape: {outputs.shape}")
         
-        detection_count = 0
         # Process each detection
-        for i, detection in enumerate(outputs):
+        for detection in outputs:
             if len(detection) >= 6:
-                # For 6-element output: [x_center, y_center, width, height, class1_conf, class2_conf]
-                # where class1 might be basketball and class2 might be hoop (or vice versa)
+                # Model format: [x_center, y_center, width, height, class1_conf, class2_conf]
                 x_center, y_center, width, height = detection[:4]
+                class1_conf = detection[4]  # basketball confidence
+                class2_conf = detection[5]  # hoop confidence
                 
-                # Get class confidences
-                class1_conf = detection[4]  # Could be basketball confidence
-                class2_conf = detection[5]  # Could be hoop confidence
+                # Use hoop confidence
+                confidence = class2_conf
                 
-                # Determine which class has higher confidence
-                if class1_conf > class2_conf:
-                    confidence = class1_conf
-                    class_id = 0
-                    class_name = "basketball"  # Assuming class 0 is basketball
-                else:
-                    confidence = class2_conf
-                    class_id = 1
-                    class_name = "hoop"  # Assuming class 1 is hoop
-                
-                # Debug first few detections
-                if i < 3:
-                    logger.debug(f"Detection {i}: center=({x_center:.3f}, {y_center:.3f}), size=({width:.3f}, {height:.3f})")
-                    logger.debug(f"  Class1 (basketball) conf: {class1_conf:.3f}, Class2 (hoop) conf: {class2_conf:.3f}")
-                    logger.debug(f"  Predicted: {class_name} (class_id: {class_id}) with confidence: {confidence:.3f}")
-                
-                # Filter by confidence
+                # Filter by confidence threshold
                 if confidence >= self.confidence_thresh:
-                    detection_count += 1
+                    # Scale coordinates to frame size
+                    scale_x = frame_width / self.input_width
+                    scale_y = frame_height / self.input_height
                     
-                    # The coordinates seem to be in a different format
-                    # Let's try treating them as already in pixel coordinates relative to input size
-                    x_center_px = (x_center / self.input_width) * frame_width
-                    y_center_px = (y_center / self.input_height) * frame_height
-                    width_px = (width / self.input_width) * frame_width
-                    height_px = (height / self.input_height) * frame_height
+                    x_center_px = x_center * scale_x
+                    y_center_px = y_center * scale_y
+                    width_px = width * scale_x
+                    height_px = height * scale_y
                     
                     # Convert to corner coordinates
                     x1 = x_center_px - width_px / 2
@@ -238,18 +213,12 @@ class HoopDetector:
                     x2 = max(0, min(x2, frame_width))
                     y2 = max(0, min(y2, frame_height))
                     
-                    logger.debug(f"Valid detection: bbox=({x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}), class={class_name}, conf={confidence:.3f}")
-                    
-                    # Create detection with class information
+                    # Create hoop detection
                     hoop_detection = HoopDetection(
                         bbox=(x1, y1, x2, y2),
-                        confidence=float(confidence),
-                        class_id=class_id,
-                        class_name=class_name
+                        confidence=float(confidence)
                     )
                     detections.append(hoop_detection)
-        
-        logger.debug(f"Found {detection_count} detections above threshold, returning {len(detections)} after processing")
         
         # Apply Non-Maximum Suppression
         if detections:
@@ -281,30 +250,6 @@ class HoopDetector:
         
         return []
     
-    def calculate_iou(self, bbox1: Tuple[float, float, float, float], 
-                     bbox2: Tuple[float, float, float, float]) -> float:
-        """Calculate IoU between two bounding boxes"""
-        x1_1, y1_1, x2_1, y2_1 = bbox1
-        x1_2, y1_2, x2_2, y2_2 = bbox2
-        
-        # Calculate intersection area
-        x1_i = max(x1_1, x1_2)
-        y1_i = max(y1_1, y1_2)
-        x2_i = min(x2_1, x2_2)
-        y2_i = min(y2_1, y2_2)
-        
-        if x2_i <= x1_i or y2_i <= y1_i:
-            return 0.0
-        
-        intersection = (x2_i - x1_i) * (y2_i - y1_i)
-        
-        # Calculate union area
-        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-        union = area1 + area2 - intersection
-        
-        return intersection / union if union > 0 else 0.0
-    
     def infer_frame(self, frame: np.ndarray) -> Tuple[List[HoopDetection], np.ndarray]:
         """
         Run inference on a single frame
@@ -334,8 +279,6 @@ class HoopDetector:
             # Draw detections on frame
             annotated_frame = self.draw_hoops(frame.copy(), detections)
             
-            logger.debug(f"Frame {self.frame_count}: Found {len(detections)} hoops")
-            
             return detections, annotated_frame
             
         except Exception as e:
@@ -343,50 +286,8 @@ class HoopDetector:
             return [], frame.copy()
     
     def draw_hoops(self, frame: np.ndarray, detections: List[HoopDetection]) -> np.ndarray:
-        """Draw detections on frame with correct class labels"""
-        for i, detection in enumerate(detections):
-            x1, y1, x2, y2 = map(int, detection.bbox)
-            
-            # Choose colors based on class
-            if detection.class_name == "basketball":
-                box_color = (0, 255, 0)  # Green for basketball
-                center_color = (0, 255, 0)
-                coord_color = (0, 255, 255)  # Yellow for ball center
-            elif detection.class_name == "hoop":
-                box_color = (255, 0, 0)  # Blue for hoop
-                center_color = (255, 0, 0)
-                coord_color = (0, 0, 255)  # Red for rim
-            else:
-                box_color = (128, 128, 128)  # Gray for unknown
-                center_color = (128, 128, 128)
-                coord_color = (128, 128, 128)
-            
-            # Draw bounding box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-            
-            # Draw center point
-            center_x, center_y = map(int, detection.center)
-            cv2.circle(frame, (center_x, center_y), 5, center_color, -1)
-            
-            # Draw rim/ball center
-            rim_x, rim_y = map(int, detection.rim_center)
-            cv2.circle(frame, (rim_x, rim_y), 3, coord_color, -1)
-            
-            # Draw labels with correct class name
-            class_display = detection.class_name.capitalize()
-            label = f"{class_display} {i+1}: {detection.confidence:.2f}"
-            cv2.putText(frame, label, (x1, y1 - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
-            
-            # Draw coordinate info based on class
-            if detection.class_name == "basketball":
-                coord_label = f"Ball: ({center_x}, {center_y})"
-            else:
-                coord_label = f"Rim: ({rim_x}, {rim_y})"
-            cv2.putText(frame, coord_label, (x1, y2 + 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, coord_color, 1)
-        
-        return frame
+        """Draw hoop detections on frame using drawing utilities"""
+        return draw_hoop_detections(frame, detections)
     
     def get_hoop_coordinates(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
@@ -452,29 +353,64 @@ class OptimizedHoopModel:
 if __name__ == "__main__":
     # Example usage
     model_path = "models/ov_models/hoopModel_openvino_model/hoopModel.xml"
+    
+    # Check if model exists
+    if not Path(model_path).exists():
+        logger.error(f"Model not found: {model_path}")
+        logger.info("Please ensure the hoop detection model is available")
+        exit(1)
+    
+    # Initialize detector
     detector = HoopDetector(model_path, DeviceType.CPU)
     
     # Process video
-    cap = cv2.VideoCapture("./data/video/parallel_angle.mov")  # or video file path
+    video_path = "./data/video/parallel_angle.mov"
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        logger.error(f"Cannot open video: {video_path}")
+        exit(1)
+    
+    logger.info("Hoop Detection Demo")
+    logger.info("Press 'q' to quit")
+    
+    frame_count = 0
     
     while True:
         ret, frame = cap.read()
         if not ret:
-            break
+            # Loop video
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
         
-        # Get hoop coordinates for AI referee
-        hoop_coords = detector.get_hoop_coordinates(frame)
+        frame_count += 1
         
         # Display results
         detections, annotated_frame = detector.infer_frame(frame)
         
-        # Print hoop coordinates
-        for hoop in hoop_coords:
-            print(f"Hoop {hoop['hoop_id']}: Rim at {hoop['rim_center']}, Confidence: {hoop['confidence']:.2f}")
+        # Print hoop coordinates every 30 frames to reduce output
+        if frame_count % 30 == 0:
+            logger.info(f"Frame {frame_count}: Found {len(detections)} hoops")
+            for i, detection in enumerate(detections):
+                print(f"Hoop {i+1}: Rim at {detection.rim_center}, Confidence: {detection.confidence:.2f}")
         
-        cv2.imshow("Hoop Detection", annotated_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # Add frame info and show
+        if annotated_frame is not None and annotated_frame.size > 0:
+            annotated_frame = draw_frame_info(annotated_frame, frame_count, len(detections))
+            cv2.imshow("Hoop Detection", annotated_frame)
+        else:
+            cv2.imshow("Hoop Detection", frame)
+        
+        # Handle key press
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            logger.info("Quit requested")
             break
+        elif key == ord('s'):
+            # Save current frame
+            save_path = f"hoop_detection_frame_{frame_count}.jpg"
+            cv2.imwrite(save_path, annotated_frame)
+            logger.info(f"Saved frame to {save_path}")
     
     cap.release()
     cv2.destroyAllWindows()

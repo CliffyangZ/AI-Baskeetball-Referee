@@ -17,20 +17,13 @@ from pathlib import Path
 import time
 
 # Import utilities
-try:
-    from .utils.image_utils import bgr_to_rgb, frame_to_base64_png
-    from .utils.matching import calculate_iou
-    from .utils.openvino_utils import (
-        DeviceType, OpenVINOInferenceEngine, FPSCounter, 
-        normalize_coordinates, ensure_frame_bounds, BaseOptimizedModel
-    )
-except ImportError:
-    from utils.image_utils import bgr_to_rgb, frame_to_base64_png
-    from utils.matching import calculate_iou
-    from utils.openvino_utils import (
-        DeviceType, OpenVINOInferenceEngine, FPSCounter, 
-        normalize_coordinates, ensure_frame_bounds, BaseOptimizedModel
-    )
+# Import directly from project root utils
+from utils.image_utils import bgr_to_rgb, frame_to_base64_png
+from utils.matching import calculate_iou
+from utils.openvino_utils import (
+    DeviceType, OpenVINOInferenceEngine, FPSCounter, 
+    normalize_coordinates, ensure_frame_bounds, BaseOptimizedModel
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -394,7 +387,7 @@ if __name__ == "__main__":
     tracker = PoseTracker(model_path, DeviceType.CPU)
     
     # Process video
-    cap = cv2.VideoCapture("./data/video/travel.mov")
+    cap = cv2.VideoCapture("./data/ky.mov")
     
     print("Pose Tracker with OpenVINO Inference")
     print("Press 'q' to quit")
