@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class StepCounter:
     def __init__(self, model_path="models/ov_models/yolov8s-pose_openvino_model/yolov8s-pose.xml", 
-                 video_path="data/video/parallel_angle.mov"):
+                 video_path="data/ky.mov"):
         """
         Initialize the step counter with PoseTracker using OpenVINO
         
