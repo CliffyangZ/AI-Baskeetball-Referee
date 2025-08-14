@@ -321,25 +321,50 @@ class PoseTracker:
             Annotated frame
         """
         for i, pose in enumerate(poses):
-            # Draw bounding box
+            # Draw bounding box with more appealing style
             x1, y1, x2, y2 = [int(coord) for coord in pose.bbox]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             
-            # Draw confidence
-            conf_text = f"Person {i}: {pose.confidence:.2f}"
-            cv2.putText(frame, conf_text, (x1, y1 - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # Draw a more visually appealing bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
             
-            # Draw keypoints
+            # Draw ID badge in top-left corner of bbox
+            badge_width = 70
+            badge_height = 25
+            cv2.rectangle(frame, (x1, y1-badge_height), (x1+badge_width, y1), (0, 165, 255), -1)
+            cv2.putText(frame, f"Person {pose.person_id}", (x1+5, y1-7), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Draw confidence as a small meter
+            meter_width = 40
+            meter_height = 4
+            meter_x = x1 + badge_width + 5
+            meter_y = y1 - 15
+            # Background bar
+            cv2.rectangle(frame, (meter_x, meter_y), (meter_x + meter_width, meter_y + meter_height), (100, 100, 100), -1)
+            # Filled portion based on confidence
+            filled_width = int(meter_width * pose.confidence)
+            cv2.rectangle(frame, (meter_x, meter_y), (meter_x + filled_width, meter_y + meter_height), 
+                         (0, 255, 0) if pose.confidence > 0.7 else (0, 165, 255), -1)
+            
+            # Draw keypoints with improved visibility
             for j, keypoint in enumerate(pose.keypoints):
                 if keypoint.visible and keypoint.confidence > self.keypoint_threshold:
                     x, y = int(keypoint.x), int(keypoint.y)
-                    # Draw keypoint
-                    cv2.circle(frame, (x, y), 3, (0, 0, 255), -1)
-                    # Draw keypoint name (optional, for debugging)
-                    # cv2.putText(frame, str(j), (x+5, y), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+                    # Draw keypoint with size based on confidence
+                    radius = max(3, int(5 * keypoint.confidence))
+                    # Use different colors for different keypoint types
+                    if j < 5:  # Face keypoints
+                        color = (255, 255, 0)  # Yellow
+                    elif j < 11:  # Upper body
+                        color = (0, 255, 255)  # Cyan
+                    else:  # Lower body
+                        color = (255, 0, 255)  # Magenta
+                    
+                    cv2.circle(frame, (x, y), radius, color, -1)
+                    # Add white outline for better visibility
+                    cv2.circle(frame, (x, y), radius, (255, 255, 255), 1)
             
-            # Draw skeleton
+            # Draw skeleton with improved visibility
             for connection in self.COCO_SKELETON:
                 kp1_idx, kp2_idx = connection[0] - 1, connection[1] - 1  # Convert to 0-based index
                 if (0 <= kp1_idx < len(pose.keypoints) and 0 <= kp2_idx < len(pose.keypoints)):
@@ -352,7 +377,23 @@ class PoseTracker:
                         
                         pt1 = (int(kp1.x), int(kp1.y))
                         pt2 = (int(kp2.x), int(kp2.y))
-                        cv2.line(frame, pt1, pt2, (255, 0, 0), 2)
+                        
+                        # Calculate average confidence for this connection
+                        avg_conf = (kp1.confidence + kp2.confidence) / 2.0
+                        
+                        # Determine line thickness based on confidence
+                        thickness = max(1, int(3 * avg_conf))
+                        
+                        # Draw line with gradient color based on body part
+                        if kp1_idx < 5 or kp2_idx < 5:  # Face connections
+                            color = (70, 130, 180)  # Steel Blue
+                        elif kp1_idx < 11 and kp2_idx < 11:  # Upper body
+                            color = (32, 165, 218)  # Dodger Blue
+                        else:  # Lower body
+                            color = (0, 128, 255)  # Royal Blue
+                        
+                        # Draw the line with anti-aliasing
+                        cv2.line(frame, pt1, pt2, color, thickness)
         
         # Draw FPS and detection count using utils
         try:
