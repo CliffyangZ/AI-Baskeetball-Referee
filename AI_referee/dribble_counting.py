@@ -29,19 +29,26 @@ logger = logging.getLogger(__name__)
 
 
 class DribbleCounter:
-    def __init__(self, model_path="models/ov_models/basketballModel_openvino_model/basketballModel.xml", 
+    def __init__(self, shared_basketball_tracker=None, model_path="models/ov_models/basketballModel_openvino_model/basketballModel.xml", 
                  video_path="data/video/dribbling.mov", 
                  config_path="tracker/basketball_config.yaml"):
         """
         Initialize the dribble counter with BasketballTracker
         
         Args:
-            model_path: Path to the OpenVINO basketball detection model
+            shared_basketball_tracker: Optional shared BasketballTracker instance
+            model_path: Path to the OpenVINO basketball detection model (used only if shared_tracker is None)
             video_path: Path to the video file to analyze
-            config_path: Path to the basketball tracker configuration file
+            config_path: Path to the basketball tracker configuration file (used only if shared_tracker is None)
         """
-        # Initialize the basketball tracker
-        self.tracker = BasketballTracker(model_path, DeviceType.CPU, config_path)
+        # Use shared tracker if provided, otherwise create a new one
+        if shared_basketball_tracker is not None:
+            self.tracker = shared_basketball_tracker
+            logger.info("Using shared BasketballTracker instance")
+        else:
+            # Initialize a new basketball tracker if no shared instance provided
+            self.tracker = BasketballTracker(model_path, DeviceType.CPU, config_path)
+            logger.info("Created new BasketballTracker instance")
         
         # Open the video
         self.cap = cv2.VideoCapture(video_path)

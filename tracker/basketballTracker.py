@@ -43,7 +43,9 @@ class BasketballTracker:
         self.config = self._load_config(config_path)
        
         # Initialize inference engine
-        self.inference_engine = OpenVINOInferenceEngine(model_path, device)
+        # Convert device to string if it's an enum
+        device_str = device.value if hasattr(device, 'value') else str(device)
+        self.inference_engine = OpenVINOInferenceEngine(model_path, device_str)
         
         # Initialize enhanced Kalman filters for each track
         self.kalman_filters = {}

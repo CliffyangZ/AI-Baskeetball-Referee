@@ -129,12 +129,17 @@ class PoseTracker:
         self.keypoint_threshold = keypoint_threshold
         
         # Initialize OpenVINO engine
-        self.inference_engine = OpenVINOInferenceEngine(model_path, device)
+        # Convert device to string if it's an enum
+        device_str = device.value if hasattr(device, 'value') else str(device)
+        self.inference_engine = OpenVINOInferenceEngine(model_path, device_str)
         
         # Performance monitoring
         self.fps_counter = FPSCounter()
         
-        logger.info(f"PoseTracker initialized with device: {device.value}, model: {pose_model.value}")
+        # Safe logging that works with both enum and string
+        device_value = device.value if hasattr(device, 'value') else device
+        pose_model_value = pose_model.value if hasattr(pose_model, 'value') else pose_model
+        logger.info(f"PoseTracker initialized with device: {device_value}, model: {pose_model_value}")
     
     # OpenVINO initialization and preprocessing now handled by inference_engine
     

@@ -11,6 +11,7 @@ from enum import Enum
 import logging
 from pathlib import Path
 import time
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -25,25 +26,24 @@ class DeviceType(Enum):
 
 class OpenVINOInferenceEngine:
     """
-    Common OpenVINO inference engine for basketball and pose tracking
-    Handles model loading, compilation, and basic preprocessing
+    OpenVINO inference engine wrapper with thread synchronization
     """
     
-    def __init__(self, model_path: str, device: DeviceType = DeviceType.CPU):
+    def __init__(self, model_path: str, device: str = "CPU"):
         """
         Initialize OpenVINO inference engine
         
         Args:
-            model_path: Path to OpenVINO IR model (.xml file)
-            device: OpenVINO device type
+            model_path: Path to OpenVINO IR model (.xml)
+            device: Target device (CPU, GPU, etc.)
         """
-        self.model_path = Path(model_path)
+        self.model_path = model_path
         self.device = device
         
         # Initialize OpenVINO components
         self._init_openvino()
         
-        logger.info(f"OpenVINO engine initialized with device: {device.value}")
+        logger.info(f"OpenVINO engine initialized with device: {device}")
     
     def _init_openvino(self):
         """Initialize OpenVINO Core and compile model"""
@@ -56,14 +56,18 @@ class OpenVINOInferenceEngine:
             self.model = self.core.read_model(self.model_path)
             
             # Compile model
+            # Handle DeviceType enum or string
+            device_str = self.device.value if hasattr(self.device, 'value') else str(self.device)
             self.compiled_model = self.core.compile_model(
                 model=self.model, 
-                device_name=self.device.value
+                device_name=device_str
             )
             
             # Get input/output info
-            self.input_layer = self.compiled_model.input(0)
-            self.output_layer = self.compiled_model.output(0)
+            self.input_layer = self.compiled_model.inputs[0]
+            
+            # Use output index instead of name to avoid tensor name issues
+            self.output_index = 0
             
             # Get input shape
             self.input_shape = self.input_layer.shape
@@ -72,6 +76,12 @@ class OpenVINOInferenceEngine:
             
             logger.info(f"Model loaded successfully. Input shape: {self.input_shape}")
             
+            # Initialize FPS counter
+            self.fps_counter = FPSCounter()
+            
+            # Add thread lock for inference synchronization
+            self.inference_lock = threading.Lock()
+        
         except Exception as e:
             logger.error(f"Failed to initialize OpenVINO: {e}")
             raise
@@ -101,18 +111,53 @@ class OpenVINOInferenceEngine:
         
         return input_tensor
     
-    def infer(self, input_tensor: np.ndarray) -> np.ndarray:
+    def infer(self, input_tensor: np.ndarray, max_retries: int = 5, retry_delay: float = 0.05) -> np.ndarray:
         """
-        Run inference on preprocessed tensor
+        Run inference on preprocessed tensor with thread synchronization and retry logic
         
         Args:
             input_tensor: Preprocessed input tensor
+            max_retries: Maximum number of retry attempts
+            retry_delay: Delay between retries in seconds
             
         Returns:
             Raw model outputs
         """
-        results = self.compiled_model([input_tensor])
-        return results[self.output_layer]
+        retry_count = 0
+        last_error = None
+        backoff_factor = 1.5  # Exponential backoff factor
+        current_delay = retry_delay
+        
+        # Try to acquire the lock with timeout
+        lock_acquired = self.inference_lock.acquire(timeout=1.0)
+        if not lock_acquired:
+            logging.warning("Could not acquire inference lock, proceeding without lock")
+        
+        try:
+            while retry_count < max_retries:
+                try:
+                    results = self.compiled_model([input_tensor])
+                    # Use output index instead of name
+                    return results[self.output_index]
+                except Exception as e:
+                    last_error = e
+                    retry_count += 1
+                    if "Infer Request is busy" in str(e):
+                        # If the model is busy, wait with exponential backoff
+                        time.sleep(current_delay)
+                        current_delay *= backoff_factor  # Increase delay for next retry
+                        continue
+                    else:
+                        # For other errors, raise immediately
+                        raise
+            
+            # If we've exhausted all retries, log and raise the last error
+            logging.error(f"Inference failed after {max_retries} retries: {last_error}")
+            return np.zeros((1, 1))  # Return empty result instead of crashing
+        finally:
+            # Always release the lock if we acquired it
+            if lock_acquired:
+                self.inference_lock.release()
 
 
 class FPSCounter:

@@ -46,6 +46,8 @@ class BallHoldingDetector:
     RIGHT_WRIST_IDX = 10  # COCO format index
     
     def __init__(self, 
+                 shared_pose_tracker=None,
+                 shared_basketball_tracker=None,
                  pose_model_path="models/ov_models/yolov8s-pose_openvino_model/yolov8s-pose.xml",
                  ball_model_path="models/ov_models/basketballModel_openvino_model/basketballModel.xml",
                  video_path="data/ky.mov",
@@ -54,16 +56,28 @@ class BallHoldingDetector:
         Initialize the ball holding detector with OpenVINO optimized trackers
         
         Args:
-            pose_model_path: Path to OpenVINO pose model XML
-            ball_model_path: Path to OpenVINO basketball model XML
+            shared_pose_tracker: Optional shared PoseTracker instance
+            shared_basketball_tracker: Optional shared BasketballTracker instance
+            pose_model_path: Path to OpenVINO pose model XML (used only if shared_pose_tracker is None)
+            ball_model_path: Path to OpenVINO basketball model XML (used only if shared_basketball_tracker is None)
             video_path: Path to input video
             device: OpenVINO device type (CPU, GPU, etc.)
         """
-        # Initialize trackers
+        # Initialize trackers - use shared instances if provided, otherwise create new ones
         try:
-            self.pose_tracker = PoseTracker(pose_model_path, device)
-            self.ball_tracker = BasketballTracker(ball_model_path, device)
-            logger.info("Initialized OpenVINO trackers successfully")
+            if shared_pose_tracker is not None:
+                self.pose_tracker = shared_pose_tracker
+                logger.info("Using shared PoseTracker instance")
+            else:
+                self.pose_tracker = PoseTracker(pose_model_path, device)
+                logger.info("Created new PoseTracker instance")
+                
+            if shared_basketball_tracker is not None:
+                self.ball_tracker = shared_basketball_tracker
+                logger.info("Using shared BasketballTracker instance")
+            else:
+                self.ball_tracker = BasketballTracker(ball_model_path, device)
+                logger.info("Created new BasketballTracker instance")
         except Exception as e:
             logger.error(f"Failed to initialize trackers: {e}")
             raise

@@ -16,23 +16,29 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 class StepCounter:
-    def __init__(self, model_path="models/ov_models/yolov8s-pose_openvino_model/yolov8s-pose.xml", 
+    def __init__(self, shared_pose_tracker=None, model_path="models/ov_models/yolov8s-pose_openvino_model/yolov8s-pose.xml", 
                  video_path="data/ky.mov"):
         """
         Initialize the step counter with PoseTracker using OpenVINO
         
         Args:
-            model_path: Path to the OpenVINO IR model (.xml file)
+            shared_pose_tracker: Optional shared PoseTracker instance
+            model_path: Path to the OpenVINO IR model (.xml file) (used only if shared_pose_tracker is None)
             video_path: Path to the video file to analyze
         """
-        # Check if model exists
-        if not os.path.exists(model_path):
-            logger.error(f"Model not found: {model_path}")
-            raise FileNotFoundError(f"Model not found: {model_path}")
-        
-        # Initialize PoseTracker
-        logger.info(f"Loading PoseTracker with OpenVINO model from {model_path}")
-        self.pose_tracker = PoseTracker(model_path, DeviceType.CPU)
+        # Use shared pose tracker if provided, otherwise create a new one
+        if shared_pose_tracker is not None:
+            self.pose_tracker = shared_pose_tracker
+            logger.info("Using shared PoseTracker instance")
+        else:
+            # Check if model exists
+            if not os.path.exists(model_path):
+                logger.error(f"Model not found: {model_path}")
+                raise FileNotFoundError(f"Model not found: {model_path}")
+            
+            # Initialize PoseTracker
+            logger.info(f"Loading PoseTracker with OpenVINO model from {model_path}")
+            self.pose_tracker = PoseTracker(model_path, DeviceType.CPU)
         
         # Open video file
         self.cap = cv2.VideoCapture(video_path)

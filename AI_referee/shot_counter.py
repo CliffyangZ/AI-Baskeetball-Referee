@@ -7,15 +7,22 @@ import math
 import numpy as np
 from utils import score, detect_down, detect_up, in_hoop_region, clean_hoop_pos, clean_ball_pos, get_device
 
-
 class ShotDetector:
-    def __init__(self):
+    def __init__(self, shared_basketball_tracker=None):
         # Load the YOLO model created from main.py - change text to your relative path
         self.overlay_text = "Waiting..."
-        self.model = YOLO("models/pt_models/hoopModel.pt")
         
-        # Uncomment this line to accelerate inference. Note that this may cause errors in some setups.
-        #self.model.half()
+        # Use shared basketball tracker if provided
+        self.shared_basketball_tracker = shared_basketball_tracker
+        if shared_basketball_tracker is None:
+            # Only load model if no shared tracker is provided
+            self.model = YOLO("models/pt_models/hoopModel.pt")
+            # Uncomment this line to accelerate inference. Note that this may cause errors in some setups.
+            #self.model.half()
+            print("Creating new shot detection model instance")
+        else:
+            print("Using shared basketball tracker for shot detection")
+            self.model = None
         
         self.class_names = ['Basketball', 'Basketball Hoop']
         self.device = get_device()
@@ -94,35 +101,61 @@ class ShotDetector:
         shot_made = False
         shot_attempted = False
         
-        # Run object detection
-        results = self.model(self.frame, stream=True, device=self.device)
+        # Use shared basketball tracker if available, otherwise use local model
+        if self.shared_basketball_tracker is not None:
+            # Get basketball coordinates from shared tracker
+            basketball_tracks, _ = self.shared_basketball_tracker.track_frame(frame)
+            
+            # Process basketball tracks
+            if basketball_tracks:
+                for track_id, track_data in basketball_tracks.items():
+                    # Extract position and confidence
+                    center = track_data.get('center', None)
+                    conf = track_data.get('confidence', 0.0)
+                    
+                    if center and conf > 0.3:
+                        self.update_ball_position(center, track_id, conf)
+                        
+                        # Draw bounding box if available
+                        if 'bbox' in track_data:
+                            x1, y1, x2, y2 = track_data['bbox']
+                            w, h = x2 - x1, y2 - y1
+                            cvzone.cornerRect(self.frame, (int(x1), int(y1), int(w), int(h)))
+            
+            # We still need to detect hoops separately
+            # This is a simplified version that assumes hoops are stationary
+            # In a full implementation, you would need a separate hoop detector
+            # or integrate it with the basketball tracker
+        else:
+            # Run object detection with local model
+            results = self.model(self.frame, stream=True, device=self.device)
 
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                # Bounding box
-                x1, y1, x2, y2 = box.xyxy[0]
-                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                w, h = x2 - x1, y2 - y1
+            for r in results:
+                boxes = r.boxes
+                for box in boxes:
+                    # Bounding box
+                    x1, y1, x2, y2 = box.xyxy[0]
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    w, h = x2 - x1, y2 - y1
 
-                # Confidence
-                conf = math.ceil((box.conf[0] * 100)) / 100
+                    # Confidence
+                    conf = math.ceil((box.conf[0] * 100)) / 100
 
-                # Class Name
-                cls = int(box.cls[0])
-                current_class = self.class_names[cls]
+                    # Class Name
+                    cls = int(box.cls[0])
+                    current_class = self.class_names[cls]
 
-                center = (int(x1 + w / 2), int(y1 + h / 2))
+                    center = (int(x1 + w / 2), int(y1 + h / 2))
 
-                # Only create ball points if high confidence or near hoop
-                if (conf > .3 or (in_hoop_region(center, self.hoop_pos) and conf > 0.15)) and current_class == "Basketball":
-                    self.update_ball_position(center, 0, conf)
-                    cvzone.cornerRect(self.frame, (x1, y1, w, h))
+                    # Only create ball points if high confidence or near hoop
+                    if (conf > .3 or (in_hoop_region(center, self.hoop_pos) and conf > 0.15)) and current_class == "Basketball":
+                        self.update_ball_position(center, 0, conf)
+                        cvzone.cornerRect(self.frame, (x1, y1, w, h))
 
-                # Create hoop points if high confidence
-                if conf > .5 and current_class == "Basketball Hoop":
-                    self.hoop_pos.append((center, self.frame_count, w, h, conf))
-                    cvzone.cornerRect(self.frame, (x1, y1, w, h))
+                    # Create hoop points if high confidence
+                    if conf > .5 and current_class == "Basketball Hoop":
+                        self.hoop_pos.append((center, self.frame_count, w, h, conf))
+                        cvzone.cornerRect(self.frame, (x1, y1, w, h))
 
         # Process the frame for shot detection
         self.clean_motion()

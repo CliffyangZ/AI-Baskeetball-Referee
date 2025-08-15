@@ -15,14 +15,16 @@ Components integrated:
 """
 
 import os
+import sys
 import cv2
-import numpy as np
 import time
 import logging
-import sys
-from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+import numpy as np
+import concurrent.futures
+from enum import Enum
 from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any, Callable
+from pathlib import Path
 
 # Add project root to path to fix imports
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,7 +35,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # Import trackers
 from tracker.basketballTracker import BasketballTracker
 from tracker.poseTracker import PoseTracker
-from tracker.utils.openvino_utils import DeviceType
+from tracker.utils.openvino_utils import DeviceType 
 
 # Import referee components
 from AI_referee.dribble_counting import DribbleCounter
@@ -74,6 +76,10 @@ class GameStatistics:
         if self.violations is None:
             self.violations = []
     
+    def update_dribble_count(self, count: int) -> None:
+        """Update the dribble count"""
+        self.dribble_count = count
+        
     @property
     def shooting_percentage(self) -> float:
         """Calculate shooting percentage"""
@@ -92,8 +98,8 @@ class BasketballReferee:
     def __init__(self, 
                  basketball_model_path="models/ov_models/basketballModel_openvino_model/basketballModel.xml",
                  pose_model_path="models/ov_models/yolov8s-pose_openvino_model/yolov8s-pose.xml",
-                 video_path="data/video/parallel_angle.mov",
-                 device=DeviceType.CPU,
+                 video_path=None,
+                 device="AUTO",
                  rules="FIBA"):
         """
         Initialize the basketball referee system
@@ -102,14 +108,30 @@ class BasketballReferee:
             basketball_model_path: Path to basketball detection model
             pose_model_path: Path to pose detection model
             video_path: Path to video file or camera index (e.g., 0)
-            device: Device to run inference on (CPU, GPU, etc.)
+            device: Device to run inference on (AUTO, CPU, GPU)
             rules: Basketball rules to follow (FIBA, NBA)
         """
         logger.info("Initializing Basketball Referee System")
         
         # Store configuration
         self.rules = rules
-        self.device = device
+        
+        # Convert string device to DeviceType enum
+        if isinstance(device, str):
+            device_str = device.upper()
+            if device_str == "CPU":
+                self.device = DeviceType.CPU
+            elif device_str == "GPU" or device_str == "CUDA":
+                self.device = DeviceType.GPU
+            elif device_str == "NPU":
+                self.device = DeviceType.NPU
+            else:
+                self.device = DeviceType.AUTO
+        else:
+            # Already a DeviceType enum
+            self.device = device
+            
+        logger.info(f"Using device: {self.device} for inference")
         
         # Initialize video source
         self.video_path = video_path
@@ -141,22 +163,32 @@ class BasketballReferee:
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         
-        # Initialize trackers
+        # Initialize trackers (shared instances)
         try:
-            self.basketball_tracker = BasketballTracker(basketball_model_path, device)
-            self.pose_tracker = PoseTracker(pose_model_path, device)
-            logger.info("Initialized trackers successfully")
+            # Pass the device as a string value instead of enum
+            device_str = self.device.value if hasattr(self.device, 'value') else str(self.device)
+            self.basketball_tracker = BasketballTracker(basketball_model_path, device_str)
+            self.pose_tracker = PoseTracker(pose_model_path, device_str)
+            logger.info("Initialized shared tracker instances successfully")
         except Exception as e:
             logger.error(f"Failed to initialize trackers: {e}")
             raise
         
-        # Initialize referee components
-        self.dribble_counter = DribbleCounter(basketball_model_path, video_path)
-        self.holding_detector = BallHoldingDetector(pose_model_path, basketball_model_path, video_path, device)
-        self.travel_detector = TravelViolationDetector(rules=rules)
+        # Initialize referee components with shared trackers
+        self.dribble_counter = DribbleCounter(shared_basketball_tracker=self.basketball_tracker, 
+                                           video_path=video_path)
+        self.holding_detector = BallHoldingDetector(shared_pose_tracker=self.pose_tracker,
+                                                 shared_basketball_tracker=self.basketball_tracker,
+                                                 video_path=video_path, 
+                                                 device=device)
+        self.step_counter = StepCounter(shared_pose_tracker=self.pose_tracker,
+                                      model_path=pose_model_path, 
+                                      video_path=video_path)
+        self.shot_detector = ShotDetector(shared_basketball_tracker=self.basketball_tracker)
+        # Initialize travel detector with the same rules setting
+        self.travel_detector = TravelViolationDetector(rules=self.rules)
+        # Initialize double dribble detector
         self.double_dribble_detector = DoubleDribbleDetector()
-        self.shot_detector = ShotDetector()
-        self.step_counter = StepCounter(pose_model_path, video_path)
         
         # Initialize statistics
         self.statistics = GameStatistics()
@@ -166,6 +198,13 @@ class BasketballReferee:
         self.last_violation_time = 0
         self.violation_cooldown = 3.0  # seconds
         self.is_holding_ball = False
+        
+        # Initialize thread pool for asynchronous processing
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self.async_results = {}
+        
+        # Configure which components can run asynchronously
+        self.use_async = True  # Can be toggled to disable async processing
         
         # Visualization settings
         self.show_stats = True
@@ -189,83 +228,176 @@ class BasketballReferee:
     
     def process_frame(self, frame):
         """
-        Process a single frame with all referee components
+        Process a single frame with all basketball referee components
         
         Args:
             frame: Input video frame
             
         Returns:
-            Annotated frame with all detections and statistics
+            Annotated frame with all detections and violations
         """
-        # Make a copy of the frame for annotations
-        annotated_frame = frame.copy()
+        # Create a copy of the frame for annotation
+        result_frame = frame.copy()
         
-        # Track basketball
+        # Track basketball and poses once (shared instances) - critical operations, run every frame
+        # These are critical and should not be run asynchronously
         basketball_tracks, basketball_frame = self.basketball_tracker.track_frame(frame)
-        
-        # Track poses
         pose_tracks, pose_frame = self.pose_tracker.infer_frame(frame)
         
-        # Process dribble detection and shot detection
-        for track in basketball_tracks:
-            track_id = track['track_id']
-            center = track['center']
-            motion_info = track['motion_info']
+        # Constants for frame skipping
+        DRIBBLE_FRAME_INTERVAL = 2  # Process every 2nd frame
+        HOLDING_FRAME_INTERVAL = 1  # Process every frame (critical)
+        STEP_FRAME_INTERVAL = 2     # Process every 2nd frame
+        SHOT_FRAME_INTERVAL = 3     # Process every 3rd frame
+        TRAVEL_FRAME_INTERVAL = 2   # Process every 2nd frame
+        ASYNC_TIMEOUT = 0.1         # Timeout for async operations in seconds
+        
+        # Initialize default values for skipped frames
+        dribble_frame = frame.copy()
+        dribble_count = self.dribble_counter.dribble_count if hasattr(self.dribble_counter, 'dribble_count') else 0
+        holding_frame = frame.copy()
+        is_holding = self.is_holding_ball
+        step_frame = frame.copy()
+        step_counts = {}
+        shot_frame = frame.copy()
+        shot_made = False
+        shot_attempted = False
+        
+        # Helper function for asynchronous processing
+        def process_component(component_name, frame_interval, process_func, frame):
+            if self.frame_count % frame_interval == 0:
+                return process_func(frame)
+            return None
+        
+        # Submit asynchronous tasks if enabled
+        futures = {}
+        if self.use_async:
+            # Process dribble counting asynchronously with frame skipping
+            if self.frame_count % DRIBBLE_FRAME_INTERVAL == 0:
+                # Create a function to update dribble count using basketball tracks
+                def update_dribble_count(tracks, frame):
+                    for track in tracks:
+                        track_id = track['track_id']
+                        center = track['center']
+                        motion_info = track['motion_info'] if 'motion_info' in track else {}
+                        self.dribble_counter.update_dribble_count(track_id, center, motion_info)
+                    return frame.copy(), self.dribble_counter.dribble_count
+                
+                # Submit the task with basketball_tracks we already have
+                futures['dribble'] = self.thread_pool.submit(
+                    update_dribble_count, basketball_tracks, frame)
             
-            # Update dribble count
-            self.dribble_counter.update_dribble_count(track_id, center, motion_info)
+            # Process step counting asynchronously with frame skipping
+            if self.frame_count % STEP_FRAME_INTERVAL == 0:
+                futures['step'] = self.thread_pool.submit(
+                    self.step_counter.process_frame, frame)
             
-            # Update shot detector with basketball position
-            self.shot_detector.update_ball_position(center, track_id)
+            # Process shot detection asynchronously with frame skipping
+            if self.frame_count % SHOT_FRAME_INTERVAL == 0:
+                futures['shot'] = self.thread_pool.submit(
+                    self.shot_detector.process_frame, frame)
         
-        # Process holding detection
-        holding_frame, is_holding = self.holding_detector.process_frame(frame.copy())
-        # Update the is_holding from the detector (redundant but for clarity)
-        is_holding = self.holding_detector.is_holding
+        # Process ball holding detection (critical for rules, no skipping, run synchronously)
+        holding_frame, is_holding = self.holding_detector.process_frame(frame)
+        self.is_holding_ball = is_holding
         
-        # Update holding state in violation detectors
-        if is_holding != self.is_holding_ball:
-            self.travel_detector.update_holding_state(is_holding)
-            self.double_dribble_detector.update_holding_state(is_holding)
-            self.is_holding_ball = is_holding
+        # Collect results from asynchronous tasks
+        if self.use_async:
+            # Get dribble results if available
+            if 'dribble' in futures:
+                try:
+                    tracks_info, dribble_frame = futures['dribble'].result(timeout=ASYNC_TIMEOUT)
+                    if dribble_frame is not None:
+                        # Get the dribble count from the counter object
+                        dribble_count = self.dribble_counter.dribble_count
+                        self.statistics.update_dribble_count(dribble_count)
+                except (concurrent.futures.TimeoutError, Exception) as e:
+                    if isinstance(e, concurrent.futures.TimeoutError):
+                        logger.warning("Dribble detection timed out, using previous results")
+                    else:
+                        logger.error(f"Error in dribble detection: {e}")
+            
+            # Get step counting results if available
+            if 'step' in futures:
+                try:
+                    step_frame, step_counts = futures['step'].result(timeout=ASYNC_TIMEOUT)
+                except (concurrent.futures.TimeoutError, Exception) as e:
+                    if isinstance(e, concurrent.futures.TimeoutError):
+                        logger.warning("Step counting timed out, using previous results")
+                    else:
+                        logger.error(f"Error in step counting: {e}")
+            
+            # Get shot detection results if available
+            if 'shot' in futures:
+                try:
+                    shot_result = futures['shot'].result(timeout=ASYNC_TIMEOUT)
+                    # The process_frame method returns (annotated_frame, shot_made, shot_attempted)
+                    if isinstance(shot_result, tuple) and len(shot_result) == 3:
+                        shot_frame, shot_made, shot_attempted = shot_result
+                        
+                        # Update shot statistics
+                        if shot_attempted:
+                            self.statistics.shot_attempts += 1
+                            if shot_made:
+                                self.statistics.shot_makes += 1
+                                
+                        # Ensure shot_frame is a valid numpy array with the same shape as frame
+                        if not isinstance(shot_frame, np.ndarray) or shot_frame.shape != frame.shape:
+                            logger.warning("Shot frame is invalid, using original frame instead")
+                            shot_frame = frame.copy()
+                except (concurrent.futures.TimeoutError, Exception) as e:
+                    if isinstance(e, concurrent.futures.TimeoutError):
+                        logger.warning("Shot detection timed out, using previous results")
+                    else:
+                        logger.error(f"Error in shot detection: {e}")
+        else:
+            # Synchronous processing for components when async is disabled
+            # Process dribble counting with frame skipping
+            if self.frame_count % DRIBBLE_FRAME_INTERVAL == 0:
+                # Use basketball tracker's results directly
+                # We already have basketball_tracks from earlier in this method
+                dribble_frame = frame.copy()
+                
+                # Update dribble count for each tracked basketball
+                for track in basketball_tracks:
+                    track_id = track['track_id']
+                    center = track['center']
+                    motion_info = track['motion_info'] if 'motion_info' in track else {}
+                    self.dribble_counter.update_dribble_count(track_id, center, motion_info)
+                    
+                dribble_count = self.dribble_counter.dribble_count
+                
+                # Process step counting with frame skipping
+                if self.frame_count % STEP_FRAME_INTERVAL == 0:
+                    step_frame, step_counts = self.step_counter.process_frame(frame)
+            
+            # Process shot detection with frame skipping
+            if self.frame_count % SHOT_FRAME_INTERVAL == 0:
+                try:
+                    shot_frame, shot_made, shot_attempted = self.shot_detector.process_frame(frame)
+                    
+                    # Update shot statistics
+                    if shot_attempted:
+                        self.statistics.shot_attempts += 1
+                        if shot_made:
+                            self.statistics.shot_makes += 1
+                except Exception as e:
+                    logger.error(f"Error in shot detection: {e}")
+                    # Use original frame if shot detection fails
+                    shot_frame = frame.copy()
+                    shot_made = False
+                    shot_attempted = False
+                    
+                # Ensure shot_frame is a valid numpy array with the same shape as frame
+                if not isinstance(shot_frame, np.ndarray) or shot_frame.shape != frame.shape:
+                    logger.warning("Shot frame is invalid, using original frame instead")
+                    shot_frame = frame.copy()
         
-        # Process step counting
-        step_frame, step_counts = self.step_counter.process_frame(frame.copy())
-        
-        # Update step counts in statistics and travel detector
-        for person_id, step_count in step_counts.items():
-            self.statistics.step_count[person_id] = step_count
-            # Detect if a step was taken by comparing with previous count
-            prev_count = self.statistics.step_count.get(person_id, 0)
-            if step_count > prev_count:
-                self.travel_detector.update_step_count(True)
-        
-        # Update dribble state in double dribble detector
+        # Update dribble state if needed
         dribble_detected = self.dribble_counter.dribble_count > self.statistics.dribble_count
         if dribble_detected:
             self.double_dribble_detector.update_dribble_state(True)
             self.statistics.dribble_count = self.dribble_counter.dribble_count
-            
-        # Process shot detection
-        try:
-            shot_frame, shot_made, shot_attempted = self.shot_detector.process_frame(frame.copy())
-            
-            # Update shot statistics
-            if shot_attempted:
-                self.statistics.shot_attempts += 1
-                if shot_made:
-                    self.statistics.shot_makes += 1
-        except Exception as e:
-            logger.error(f"Error in shot detection: {e}")
-            # Use original frame if shot detection fails
-            shot_frame = frame.copy()
-            shot_made = False
-            shot_attempted = False
-            
-        # Ensure shot_frame is a valid numpy array with the same shape as frame
-        if not isinstance(shot_frame, np.ndarray) or shot_frame.shape != frame.shape:
-            logger.warning("Shot frame is invalid, using original frame instead")
-            shot_frame = frame.copy()
         
         # Check for violations
         self._check_violations()
@@ -320,76 +452,53 @@ class BasketballReferee:
             logger.info(f"Double dribble violation detected: {violation.description}")
     
     def _combine_annotations(self, original_frame, basketball_frame, pose_frame, holding_frame, step_frame, shot_frame):
-        """Combine annotations from all components onto one frame"""
+        """Combine annotations from all components onto one frame using optimized processing"""
         # Start with the original frame to preserve brightness
         result = original_frame.copy()
         
-        # Extract basketball tracking annotations (only the annotations, not the background)
-        try:
-            basketball_mask = cv2.absdiff(basketball_frame, original_frame)
-            basketball_mask = cv2.cvtColor(basketball_mask, cv2.COLOR_BGR2GRAY)
-            _, basketball_mask = cv2.threshold(basketball_mask, 25, 255, cv2.THRESH_BINARY)
-            basketball_mask = cv2.cvtColor(basketball_mask, cv2.COLOR_GRAY2BGR)
-            basketball_elements = cv2.bitwise_and(basketball_frame, basketball_mask)
-            result = cv2.addWeighted(result, 1.0, basketball_elements, 1.0, 0)
-        except Exception as e:
-            logger.error(f"Error applying basketball annotations: {e}")
+        # Create a common function for extracting annotations to avoid code duplication
+        def extract_annotations(annotated_frame, original):
+            if annotated_frame is None or original is None:
+                return None
+                
+            if annotated_frame.shape != original.shape or annotated_frame.dtype != original.dtype:
+                return None
+                
+            try:
+                # Use a more efficient approach with fewer conversions
+                # Calculate difference between annotated frame and original
+                diff = cv2.absdiff(annotated_frame, original)
+                
+                # Convert to grayscale and threshold in one step
+                gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+                _, mask = cv2.threshold(gray_diff, 25, 255, cv2.THRESH_BINARY)
+                
+                # Create a 3-channel mask more efficiently
+                mask_3ch = cv2.merge([mask, mask, mask])
+                
+                # Extract only the annotations
+                return cv2.bitwise_and(annotated_frame, mask_3ch)
+            except Exception as e:
+                logger.error(f"Error extracting annotations: {e}")
+                return None
         
-        # Add pose keypoints and skeletons (without bounding boxes to avoid clutter)
-        try:
-            pose_mask = cv2.absdiff(pose_frame, original_frame)
-            pose_mask = cv2.cvtColor(pose_mask, cv2.COLOR_BGR2GRAY)
-            _, pose_mask = cv2.threshold(pose_mask, 25, 255, cv2.THRESH_BINARY)
-            pose_mask = cv2.cvtColor(pose_mask, cv2.COLOR_GRAY2BGR)
-            pose_elements = cv2.bitwise_and(pose_frame, pose_mask)
-            result = cv2.addWeighted(result, 1.0, pose_elements, 1.0, 0)
-        except Exception as e:
-            logger.error(f"Error applying pose annotations: {e}")
+        # Process all frames in a batch to reduce redundant operations
+        frames_to_process = [
+            ("basketball", basketball_frame),
+            ("pose", pose_frame),
+            ("holding", holding_frame),
+            ("step", step_frame),
+            ("shot", shot_frame)
+        ]
         
-        # Add holding indicators
-        try:
-            # Ensure frames are compatible for absdiff
-            if holding_frame.shape == original_frame.shape and holding_frame.dtype == original_frame.dtype:
-                holding_mask = cv2.absdiff(holding_frame, original_frame)
-                holding_mask = cv2.cvtColor(holding_mask, cv2.COLOR_BGR2GRAY)
-                _, holding_mask = cv2.threshold(holding_mask, 25, 255, cv2.THRESH_BINARY)
-                holding_mask = cv2.cvtColor(holding_mask, cv2.COLOR_GRAY2BGR)
-                holding_elements = cv2.bitwise_and(holding_frame, holding_mask)
-                result = cv2.addWeighted(result, 1.0, holding_elements, 1.0, 0)
+        # Extract and combine annotations in one pass
+        for name, frame in frames_to_process:
+            annotations = extract_annotations(frame, original_frame)
+            if annotations is not None:
+                # Add annotations to result frame
+                result = cv2.addWeighted(result, 1.0, annotations, 1.0, 0)
             else:
-                logger.warning("Holding frame and original frame are not compatible for absdiff")
-        except Exception as e:
-            logger.error(f"Error applying holding indicators: {e}")
-        
-        # Add step counting indicators
-        try:
-            # Ensure frames are compatible for absdiff
-            if step_frame.shape == original_frame.shape and step_frame.dtype == original_frame.dtype:
-                step_mask = cv2.absdiff(step_frame, original_frame)
-                step_mask = cv2.cvtColor(step_mask, cv2.COLOR_BGR2GRAY)
-                _, step_mask = cv2.threshold(step_mask, 25, 255, cv2.THRESH_BINARY)
-                step_mask = cv2.cvtColor(step_mask, cv2.COLOR_GRAY2BGR)
-                step_elements = cv2.bitwise_and(step_frame, step_mask)
-                result = cv2.addWeighted(result, 1.0, step_elements, 1.0, 0)
-            else:
-                logger.warning("Step frame and original frame are not compatible for absdiff")
-        except Exception as e:
-            logger.error(f"Error applying step indicators: {e}")
-        
-        # Add shot detection indicators
-        try:
-            # Ensure frames are compatible for absdiff
-            if shot_frame.shape == original_frame.shape and shot_frame.dtype == original_frame.dtype:
-                shot_mask = cv2.absdiff(shot_frame, original_frame)
-                shot_mask = cv2.cvtColor(shot_mask, cv2.COLOR_BGR2GRAY)
-                _, shot_mask = cv2.threshold(shot_mask, 25, 255, cv2.THRESH_BINARY)
-                shot_mask = cv2.cvtColor(shot_mask, cv2.COLOR_GRAY2BGR)
-                shot_elements = cv2.bitwise_and(shot_frame, shot_mask)
-                result = cv2.addWeighted(result, 1.0, shot_elements, 1.0, 0)
-            else:
-                logger.warning("Shot frame and original frame are not compatible for absdiff")
-        except Exception as e:
-            logger.error(f"Error applying shot indicators: {e}")
+                logger.debug(f"No annotations extracted for {name} frame")
         
         return result
     
@@ -544,10 +653,10 @@ def main():
     """Main entry point"""
     try:
         import argparse
-        
+       
         # Parse command line arguments
         parser = argparse.ArgumentParser(description='AI Basketball Referee System')
-        parser.add_argument('--video', type=str, default=0,
+        parser.add_argument('--video', type=str, default='data/video/parallel_angle.mov',
                           help='Path to input video file')
         parser.add_argument('--basketball-model', type=str, 
                           default="models/ov_models/basketballModel_openvino_model/basketballModel.xml",
