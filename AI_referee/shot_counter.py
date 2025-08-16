@@ -5,7 +5,7 @@ import cv2
 import cvzone
 import math
 import numpy as np
-from .utils import score, detect_down, detect_up, in_hoop_region, clean_hoop_pos, clean_ball_pos, get_device
+from utils import score, detect_down, detect_up, in_hoop_region, clean_hoop_pos, clean_ball_pos, get_device
 
 class ShotDetector:
     def __init__(self, shared_basketball_tracker=None):
@@ -72,7 +72,7 @@ class ShotDetector:
                 break
 
             # Process the frame
-            processed_frame = self.process_frame(self.frame)
+            processed_frame, shot_made, shot_attempted = self.process_frame(self.frame)
             
             # Display the processed frame
             cv2.imshow('Frame', processed_frame)

@@ -374,7 +374,12 @@ def main():
     
     # Initialize and run dribble counter
     try:
-        dribble_counter = DribbleCounter(model_path, video_path, config_path)
+        dribble_counter = DribbleCounter(
+            shared_basketball_tracker=None,
+            model_path=model_path, 
+            video_path=video_path, 
+            config_path=config_path
+        )
         dribble_counter.run()
     except Exception as e:
         logger.error(f"Failed to run dribble counter: {e}")
