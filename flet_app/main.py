@@ -46,5 +46,5 @@ def main(page: ft.Page):
     page.add(home)  # Add home screen to the main page
 
 if __name__ == "__main__":
-    check_virtualenv()
+    #check_virtualenv()
     ft.app(target=main)

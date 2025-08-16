@@ -11,6 +11,8 @@ import flet as ft
 import cv2
 import base64
 import asyncio
+import threading
+import time
 
 class HomePage(ft.Column):
     def __init__(self, page: ft.Page):
@@ -88,7 +90,23 @@ class HomePage(ft.Column):
         )
 
         self.section4 = ft.Container(
-            content=ft.Text("Section 4"),
+            content=ft.Column([
+                ft.Text("AI Basketball Referee", size=18, weight=ft.FontWeight.BOLD),
+                ft.Divider(height=1),
+                ft.ElevatedButton(
+                    "Launch Referee Detection",
+                    icon="sports_basketball",
+                    on_click=self._launch_referee,
+                    color="#FFFFFF",
+                    bgcolor="#1976D2",
+                    width=200
+                ),
+                ft.Text("Real-time basketball detection with:", size=12),
+                ft.Text("• Basketball tracking", size=11, color="#757575"),
+                ft.Text("• Hoop detection", size=11, color="#757575"),
+                ft.Text("• Pose estimation", size=11, color="#757575"),
+                ft.Text("• Live statistics", size=11, color="#757575"),
+            ], spacing=8),
             bgcolor="white",
             padding=10
         )
@@ -173,7 +191,7 @@ class HomePage(ft.Column):
             f"Scale: {self.scale_factor}"
         )
 
-    async def _stream_camera(self):
+    def _stream_camera(self):
         while self.streaming and self.cap and self.cap.isOpened():
             ret, frame = self.cap.read()
             if not ret:
@@ -183,12 +201,13 @@ class HomePage(ft.Column):
             if self.section1_width > 0 and self.section1_height > 0:
                 frame = cv2.resize(frame, (self.section1_width, self.section1_height))
 
+            # Convert BGR to RGB for correct color display
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            _, buffer = cv2.imencode(".png", frame_rgb)
+            _, buffer = cv2.imencode(".jpg", frame_rgb)
             img_data = base64.b64encode(buffer).decode("utf-8")
             self.camera_feed.src_base64 = img_data
             self.page.update()
-            await asyncio.sleep(1/30)  # ~30 FPS
+            time.sleep(1/30)  # ~30 FPS
 
     def start_camera(self, e):
         if self.streaming:
@@ -198,7 +217,8 @@ class HomePage(ft.Column):
             print("Error: Could not open camera.")
             return
         self.streaming = True
-        asyncio.create_task(self._stream_camera())
+        self.stream_thread = threading.Thread(target=self._stream_camera, daemon=True)
+        self.stream_thread.start()
 
     def stop_camera(self):
         if self.streaming:
@@ -206,3 +226,23 @@ class HomePage(ft.Column):
             if self.cap:
                 self.cap.release()
                 self.cap = None
+            try:
+                if hasattr(self, "stream_thread") and self.stream_thread.is_alive():
+                    self.stream_thread.join(timeout=0.5)
+            except Exception:
+                pass
+
+    def _launch_referee(self, e):
+        """Launch the referee detection interface"""
+        import subprocess
+        import sys
+        import os
+        
+        # Get the path to main_referee.py
+        referee_script = os.path.join(os.path.dirname(__file__), '..', '..', 'main_referee.py')
+        
+        try:
+            # Launch the referee interface in a new process
+            subprocess.Popen([sys.executable, referee_script])
+        except Exception as ex:
+            print(f"Error launching referee interface: {ex}")

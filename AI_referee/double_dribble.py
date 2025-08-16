@@ -46,6 +46,9 @@ class DoubleDribbleDetector:
         self.dribble_count = 0
         self.dribble_history: List[Dict[str, Any]] = []
         
+        # Basketball tracking
+        self.basketball_positions = {}
+        
         # Debug info
         self.debug_info = {}
     
@@ -162,22 +165,151 @@ class DoubleDribbleDetector:
         Get the current violation status
         
         Returns:
-            Dict with violation status information
+            Dict with violation information
         """
-        # Clear violation after cooldown
-        if (self.violation_detected and self.violation_timestamp and 
-            time.time() - self.violation_timestamp > self.violation_cooldown):
-            self.violation_detected = False
-        
         return {
-            'violation_type': 'double_dribble' if self.violation_detected else None,
-            'timestamp': self.violation_timestamp,
+            'violation_detected': self.violation_detected,
+            'violation_timestamp': self.violation_timestamp,
             'dribble_count': self.dribble_count,
             'dribble_sequence_active': self.dribble_sequence_active,
             'dribble_ended': self.dribble_ended,
             'is_holding': self.is_holding,
             'debug_info': self.debug_info
         }
+        
+    def process_frame(self, frame):
+        """
+        Process a video frame to detect double dribble violations
+        
+        Args:
+            frame: Video frame to process
+            
+        Returns:
+            Tuple of (result_dict, annotated_frame)
+        """
+        # For the double dribble detector, we don't process frames directly
+        # Instead, we rely on external dribble and holding detection
+        # This method is implemented for compatibility with the referee system
+        
+        # Create a copy of the frame for annotations
+        annotated_frame = frame.copy()
+        
+        # Get current violation status
+        result = self.get_violation_status()
+        
+        # Add visualization to the frame
+        self._annotate_frame(annotated_frame)
+        
+        return result, annotated_frame
+        
+    def _annotate_frame(self, frame):
+        """
+        Add visualization overlays to the frame
+        
+        Args:
+            frame: Frame to annotate
+        """
+        import cv2
+        
+        # Get frame dimensions
+        h, w = frame.shape[:2]
+        
+        # Add violation status overlay
+        status_text = []
+        
+        # Violation status
+        if self.violation_detected:
+            status_text.append("DOUBLE DRIBBLE VIOLATION DETECTED!")
+            # Add red overlay for violations
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 255), -1)
+            cv2.addWeighted(overlay, 0.2, frame, 0.8, 0, frame)
+        
+        # Current state
+        status_text.append(f"Holding: {'Yes' if self.is_holding else 'No'}")
+        status_text.append(f"Dribble Count: {self.dribble_count}")
+        status_text.append(f"Dribble Sequence: {'Active' if self.dribble_sequence_active else 'Inactive'}")
+        status_text.append(f"Dribble Ended: {'Yes' if self.dribble_ended else 'No'}")
+        
+        # Draw status text
+        for i, text in enumerate(status_text):
+            y_pos = 30 + (i * 30)
+            # Add black outline for better visibility
+            cv2.putText(frame, text, (21, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
+            cv2.putText(frame, text, (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+    def process_frame_with_tracks(self, frame, basketball_tracks, pose_tracks=None):
+        """
+        Process a frame with pre-detected basketball and pose tracks.
+        
+        Args:
+            frame: Input video frame
+            basketball_tracks: Dictionary or list of basketball tracks from the tracker
+            pose_tracks: Optional dictionary or list of pose tracks
+            
+        Returns:
+            dict: Dictionary containing double dribble detection results
+            frame: Annotated frame
+        """
+        try:
+            # Create a copy of the frame for annotation
+            annotated_frame = frame.copy() if frame is not None else None
+            
+            # Process basketball tracks
+            if basketball_tracks:
+                # Handle different track formats
+                if isinstance(basketball_tracks, dict):
+                    # Dictionary format with track_id as keys
+                    for track_id, track_data in basketball_tracks.items():
+                        # Extract position
+                        center = track_data.get('center', None)
+                        
+                        if center:
+                            # Update basketball position
+                            self.basketball_positions[track_id] = center
+                elif isinstance(basketball_tracks, list):
+                    # List format with track objects
+                    for i, track_data in enumerate(basketball_tracks):
+                        # Extract track ID and center
+                        track_id = track_data.get('track_id', i) if isinstance(track_data, dict) else i
+                        
+                        # Handle different track data formats
+                        if isinstance(track_data, dict):
+                            center = track_data.get('center', None)
+                            
+                            if center:
+                                # Update basketball position
+                                self.basketball_positions[track_id] = center
+                        elif isinstance(track_data, tuple) and len(track_data) >= 2:
+                            # Assume tuple format (center_x, center_y, ...)
+                            center = (track_data[0], track_data[1])
+                            self.basketball_positions[track_id] = center
+            
+            # Process pose tracks if available
+            if pose_tracks:
+                # Similar handling for different pose track formats
+                if isinstance(pose_tracks, dict):
+                    for person_id, pose_data in pose_tracks.items():
+                        # Process pose data
+                        pass
+                elif isinstance(pose_tracks, list):
+                    for i, pose_data in enumerate(pose_tracks):
+                        # Process pose data
+                        pass
+            
+            # Get current violation status
+            result = self.get_violation_status()
+            
+            # Add visualization to the frame
+            if annotated_frame is not None:
+                self._annotate_frame(annotated_frame)
+            
+            return result, annotated_frame
+            
+        except Exception as e:
+            logger.error(f"Error in process_frame_with_tracks: {e}")
+            # Return empty result and original frame
+            return self.get_violation_status(), frame
 
 
 if __name__ == "__main__":

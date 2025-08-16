@@ -327,6 +327,240 @@ class StepCounter:
         # Return annotated frame and dictionary of person step counts
         person_steps = {person_id: data['step_count'] for person_id, data in self.person_data.items()}
         return annotated_frame, person_steps
+        
+    def _update_step_count(self, person_id, keypoints, annotated_frame=None):
+        """
+        Update step count for a specific person based on ankle movement
+        
+        Args:
+            person_id: ID of the person to update
+            keypoints: List of keypoints for the person
+            annotated_frame: Optional frame for visualization
+        """
+        try:
+            # Get person's tracking data
+            person_tracking = self.person_data[person_id]
+            
+            # Extract ankle and knee keypoints
+            left_knee = keypoints[self.body_index["left_knee"]]
+            right_knee = keypoints[self.body_index["right_knee"]]
+            left_ankle = keypoints[self.body_index["left_ankle"]]
+            right_ankle = keypoints[self.body_index["right_ankle"]]
+            
+            # Check if all keypoints have sufficient confidence
+            if (left_knee.confidence > 0.5 and right_knee.confidence > 0.5 and 
+                left_ankle.confidence > 0.5 and right_ankle.confidence > 0.5):
+                
+                # Check for step if we have previous positions and not in cooldown
+                if (person_tracking['prev_left_ankle_y'] is not None and 
+                    person_tracking['prev_right_ankle_y'] is not None and 
+                    person_tracking['wait_frames'] == 0):
+                    
+                    # Calculate vertical movement of ankles
+                    left_diff = abs(left_ankle.y - person_tracking['prev_left_ankle_y'])
+                    right_diff = abs(right_ankle.y - person_tracking['prev_right_ankle_y'])
+                    
+                    # Store the ankle movement for visualization
+                    person_tracking['left_diff'] = left_diff
+                    person_tracking['right_diff'] = right_diff
+                    person_tracking['max_diff'] = max(left_diff, right_diff)
+                    
+                    # Calculate adaptive threshold based on person's height in the frame
+                    threshold = self.base_step_threshold
+                    
+                    if self.distance_adaptation:
+                        # Calculate person height (distance between ankle and shoulder)
+                        left_shoulder = keypoints[self.body_index["left_shoulder"]]
+                        right_shoulder = keypoints[self.body_index["right_shoulder"]]
+                        
+                        if (left_shoulder.confidence > 0.5 and left_ankle.confidence > 0.5):
+                            person_height = abs(left_shoulder.y - left_ankle.y)
+                        elif (right_shoulder.confidence > 0.5 and right_ankle.confidence > 0.5):
+                            person_height = abs(right_shoulder.y - right_ankle.y)
+                        else:
+                            # Fallback if shoulders aren't visible
+                            person_height = 400  # Default height
+                        
+                        # Store the person height for tracking
+                        person_tracking['person_height'] = person_height
+                        
+                        # Add to height history for smoothing (keep last 5 values)
+                        person_tracking['height_history'].append(person_height)
+                        if len(person_tracking['height_history']) > 5:
+                            person_tracking['height_history'] = person_tracking['height_history'][-5:]
+                        
+                        # Use average height for more stable threshold
+                        avg_height = sum(person_tracking['height_history']) / len(person_tracking['height_history'])
+                        
+                        # Scale threshold proportionally with height (smaller person = smaller threshold)
+                        # Reference height of 400 pixels (close to camera)
+                        reference_height = 400
+                        height_ratio = avg_height / reference_height
+                        threshold = max(5, self.base_step_threshold * height_ratio)
+                        
+                        # Store the current adaptive threshold for debugging/display
+                        person_tracking['current_threshold'] = threshold
+                    
+                    # If either ankle moved more than adaptive threshold, count as step
+                    if max(left_diff, right_diff) > threshold:
+                        person_tracking['step_count'] += 1
+                        logger.info(f"Step detected for Person {person_id}! Count: {person_tracking['step_count']}")
+                        
+                        # Set cooldown to prevent multiple detections
+                        person_tracking['wait_frames'] = self.min_wait_frames
+                        
+                        # Mark this as a detected step for visualization
+                        person_tracking['step_detected'] = True
+                    else:
+                        person_tracking['step_detected'] = False
+                
+                # Update previous positions
+                person_tracking['prev_left_ankle_y'] = left_ankle.y
+                person_tracking['prev_right_ankle_y'] = right_ankle.y
+                
+                # Decrease cooldown counter if active
+                if person_tracking['wait_frames'] > 0:
+                    person_tracking['wait_frames'] -= 1
+        except Exception as e:
+            logger.error(f"Error updating step count for person {person_id}: {e}")
+    
+    def _draw_step_info(self, frame):
+        """
+        Draw step counter information on the frame
+        
+        Args:
+            frame: Frame to draw on
+        """
+        # Create semi-transparent overlay for the stats panel
+        h, w = frame.shape[:2]
+        panel_height = 30 + (len(self.person_data) * 40) + 40  # Header + person rows + padding
+        panel_width = 280  # Width to accommodate visualization
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (panel_width, panel_height), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        
+        # Draw panel border
+        cv2.rectangle(frame, (10, 10), (panel_width, panel_height), (255, 255, 255), 2)
+        
+        # Draw title
+        cv2.putText(frame, "STEP COUNTER", 
+                   (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # Draw horizontal separator
+        cv2.line(frame, (20, 45), (panel_width-10, 45), (255, 255, 255), 1)
+        
+        # Show individual step counts with adaptive threshold info
+        sorted_persons = sorted(self.person_data.items())
+        for i, (person_id, data) in enumerate(sorted_persons):
+            y_pos = 70 + (i * 40)  # Increased vertical spacing between persons
+            
+            # Person ID with colored circle
+            cv2.circle(frame, (30, y_pos-5), 8, (0, 165, 255), -1)
+            cv2.putText(frame, f"{person_id}", 
+                       (27, y_pos-2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            
+            # Step count
+            cv2.putText(frame, f"Steps: {data['step_count']}", 
+                       (50, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Show adaptive threshold and movement visualization if enabled
+            if self.distance_adaptation and 'current_threshold' in data:
+                # Display threshold value
+                threshold_text = f"Threshold: {data['current_threshold']:.1f}"
+                cv2.putText(frame, threshold_text, 
+                          (160, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+                
+                # Draw movement meter to visualize ankle movement vs threshold
+                meter_x = 160
+                meter_y = y_pos + 10
+                meter_width = 80
+                meter_height = 6
+                
+                # Background bar
+                cv2.rectangle(frame, (meter_x, meter_y), 
+                             (meter_x + meter_width, meter_y + meter_height), 
+                             (100, 100, 100), -1)
+                
+                # Threshold marker
+                threshold_x = meter_x + int((data['current_threshold'] / 30) * meter_width)
+                cv2.line(frame, 
+                         (threshold_x, meter_y - 2), 
+                         (threshold_x, meter_y + meter_height + 2), 
+                         (255, 200, 0), 2)
+                
+                # Current movement level
+                movement_width = int((min(data['max_diff'], 30) / 30) * meter_width)
+                movement_color = (0, 255, 0) if data['step_detected'] else (0, 165, 255)
+                cv2.rectangle(frame, (meter_x, meter_y), 
+                             (meter_x + movement_width, meter_y + meter_height), 
+                             movement_color, -1)
+        
+        # Show total steps at the bottom of the panel
+        total_steps = sum(person['step_count'] for person in self.person_data.values())
+        y_pos = panel_height - 15
+        cv2.line(frame, (20, y_pos-20), (panel_width-10, y_pos-20), (255, 255, 255), 1)
+        cv2.putText(frame, f"Total Steps: {total_steps}", 
+                   (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    
+    def process_frame_with_poses(self, frame, pose_detections, annotated_frame=None):
+        """
+        Process a frame with pre-detected poses for step counting
+        
+        Args:
+            frame: Original video frame
+            pose_detections: List of pose detections
+            annotated_frame: Optional pre-annotated frame
+            
+        Returns:
+            Tuple of (result_dict, annotated_frame)
+        """
+        try:
+            if annotated_frame is None:
+                annotated_frame = frame.copy()
+                
+            # Process keypoints for all detected persons
+            if pose_detections and len(pose_detections) > 0:
+                # Process each detected person
+                for pose in pose_detections:
+                    person_id = pose.person_id
+                    keypoints = pose.keypoints
+                    
+                    # Initialize person data if not exists
+                    if person_id not in self.person_data:
+                        self.person_data[person_id] = {
+                            'step_count': 0,
+                            'prev_left_ankle_y': None,
+                            'prev_right_ankle_y': None,
+                            'wait_frames': 0,
+                            'current_threshold': self.base_step_threshold,
+                            'person_height': None,
+                            'height_history': [],
+                            'left_diff': 0,
+                            'right_diff': 0,
+                            'max_diff': 0,
+                            'step_detected': False
+                        }
+                    
+                    # Update step counting for this person
+                    self._update_step_count(person_id, keypoints, annotated_frame)
+            
+            # Draw step count for all tracked persons
+            self._draw_step_info(annotated_frame)
+            
+            # Prepare result dictionary
+            step_counts = {}
+            for person_id, data in self.person_data.items():
+                step_counts[person_id] = data['step_count']
+                
+            result = {
+                'step_counts': step_counts
+            }
+            
+            return result, annotated_frame
+            
+        except Exception as e:
+            logger.error(f"Error processing poses for step counting: {e}")
+            return {'step_counts': {k: v['step_count'] for k, v in self.person_data.items()}}, annotated_frame
     
     def run(self):
         """

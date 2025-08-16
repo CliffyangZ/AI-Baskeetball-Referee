@@ -274,6 +274,30 @@ class BallHoldingDetector:
         except Exception as e:
             logger.debug(f"Error in basketball tracking: {e}")
             return {'tracks': [], 'frame': frame.copy(), 'position': (False, 0, 0, None)}
+            
+    def _track_poses(self, frame):
+        """Track poses in frame
+        
+        Args:
+            frame: Input video frame
+            
+        Returns:
+            Dictionary with pose detections and annotated frame
+        """
+        try:
+            # Use pose tracker to detect poses in the frame
+            pose_detections, annotated_frame = self.pose_tracker.detect_poses(frame)
+            
+            return {
+                'detections': pose_detections,
+                'frame': annotated_frame
+            }
+        except Exception as e:
+            logger.debug(f"Error in pose tracking: {e}")
+            return {
+                'detections': [],
+                'frame': frame.copy()
+            }
     
     def _sort_tracks_by_confidence(self, tracks):
         """Sort tracks by confidence if available"""
@@ -296,11 +320,16 @@ class BallHoldingDetector:
                 return True, x, y, bbox
             elif hasattr(ball_track, 'center') and isinstance(ball_track.center, tuple) and len(ball_track.center) == 2:
                 x, y = ball_track.center
-                bbox = ball_track.get('bbox', None)
+                bbox = getattr(ball_track, 'bbox', None)
                 return True, x, y, bbox
             elif isinstance(ball_track, dict) and 'center' in ball_track:
                 x, y = ball_track['center']
                 bbox = ball_track.get('bbox', None)
+                return True, x, y, bbox
+            elif isinstance(ball_track, tuple) and len(ball_track) >= 2:
+                # Handle tuple format
+                x, y = ball_track[0], ball_track[1]
+                bbox = ball_track[2] if len(ball_track) > 2 else None
                 return True, x, y, bbox
             else:
                 logger.debug(f"Unexpected ball track format: {type(ball_track)}")
@@ -308,17 +337,6 @@ class BallHoldingDetector:
         except Exception as e:
             logger.debug(f"Error extracting ball position: {e}")
             return False, 0, 0, None
-    
-    def _track_poses(self, frame):
-        """Track human poses in frame"""
-        try:
-            pose_detections, pose_frame = self.pose_tracker.infer_frame(frame)
-            if pose_detections is None:
-                pose_detections = []
-            return {'detections': pose_detections, 'frame': pose_frame}
-        except Exception as e:
-            logger.debug(f"Error in pose tracking: {e}")
-            return {'detections': [], 'frame': frame.copy()}
     
     def _process_wrists(self, pose_detections, frame, ball_position=None):
         """Process wrist keypoints from pose detections
@@ -330,85 +348,113 @@ class BallHoldingDetector:
         """
         left_wrist = None
         right_wrist = None
-        have_valid_pose = False
+        closest_person = None
+        min_distance = float('inf')
         person_id = None
+        have_valid_pose = False
+        person = None
         
-        # Extract wrist positions from pose detection
-        if pose_detections and len(pose_detections) > 0:
-            # If we have multiple people and know ball position, find closest person to ball
-            if len(pose_detections) > 1 and ball_position is not None:
-                ball_x, ball_y = ball_position
-                closest_person = None
-                min_distance = float('inf')
-                
-                for i, person in enumerate(pose_detections):
-                    if len(person.keypoints) <= max(self.LEFT_WRIST_IDX, self.RIGHT_WRIST_IDX):
-                        continue
-                        
-                    # Calculate average position of both wrists
-                    left_wrist_kp = person.keypoints[self.LEFT_WRIST_IDX]
-                    right_wrist_kp = person.keypoints[self.RIGHT_WRIST_IDX]
-                    
-                    if (left_wrist_kp.confidence > self.pose_confidence_threshold and 
-                        right_wrist_kp.confidence > self.pose_confidence_threshold):
-                        
-                        # Calculate distance from wrists to ball
-                        left_dist = np.linalg.norm(np.array([left_wrist_kp.x, left_wrist_kp.y]) - 
-                                                  np.array([ball_x, ball_y]))
-                        right_dist = np.linalg.norm(np.array([right_wrist_kp.x, right_wrist_kp.y]) - 
-                                                   np.array([ball_x, ball_y]))
-                        
-                        # Use minimum distance of either wrist
-                        dist = min(left_dist, right_dist)
-                        
-                        if dist < min_distance:
-                            min_distance = dist
-                            closest_person = person
-                            person_id = i
-                
-                # Use the closest person if found
-                if closest_person is not None:
-                    person = closest_person
-                    print(f"Selected person {person_id} as closest to ball (distance: {min_distance:.1f}px)")
-                else:
-                    # Fall back to highest confidence person
-                    person = sorted(pose_detections, key=lambda x: x.confidence, reverse=True)[0]
-                    person_id = pose_detections.index(person)
-                    print(f"Using highest confidence person {person_id} (no valid wrists found near ball)")
+        if not pose_detections:
+            return {'left_wrist': None, 'right_wrist': None, 'person_id': None}
+        
+        # Find closest person to ball if ball position is provided
+        if ball_position is not None:
+            # Extract ball coordinates based on type
+            if isinstance(ball_position, dict):
+                ball_x = ball_position.get('x', 0)
+                ball_y = ball_position.get('y', 0)
+            elif isinstance(ball_position, (list, tuple)) and len(ball_position) >= 2:
+                ball_x, ball_y = ball_position[0], ball_position[1]
             else:
-                # Use highest confidence person when only one person or no ball position
-                person = sorted(pose_detections, key=lambda x: x.confidence, reverse=True)[0]
-                person_id = pose_detections.index(person)
-            
-            if len(person.keypoints) > max(self.LEFT_WRIST_IDX, self.RIGHT_WRIST_IDX):
-                left_wrist_kp = person.keypoints[self.LEFT_WRIST_IDX]
-                right_wrist_kp = person.keypoints[self.RIGHT_WRIST_IDX]
+                # If ball_position is in an unexpected format, use center of frame as fallback
+                if frame is not None:
+                    ball_x, ball_y = frame.shape[1] // 2, frame.shape[0] // 2
+                else:
+                    ball_x, ball_y = 0, 0
+                    
+            # Find person with wrists closest to ball
+            for i, p in enumerate(pose_detections):
+                # Check if person has keypoints
+                if not hasattr(p, 'keypoints') or len(p.keypoints) <= max(self.LEFT_WRIST_IDX, self.RIGHT_WRIST_IDX):
+                    continue
+                    
+                left_wrist_kp = p.keypoints[self.LEFT_WRIST_IDX]
+                right_wrist_kp = p.keypoints[self.RIGHT_WRIST_IDX]
                 
-                # Check confidence and extract coordinates
+                # Check confidence
                 if (left_wrist_kp.confidence > self.pose_confidence_threshold and 
                     right_wrist_kp.confidence > self.pose_confidence_threshold):
                     
-                    left_wrist = np.array([left_wrist_kp.x, left_wrist_kp.y, left_wrist_kp.confidence])
-                    right_wrist = np.array([right_wrist_kp.x, right_wrist_kp.y, right_wrist_kp.confidence])
+                    # Calculate distance from each wrist to ball
+                    left_dist = np.sqrt((left_wrist_kp.x - ball_x)**2 + (left_wrist_kp.y - ball_y)**2)
+                    right_dist = np.sqrt((right_wrist_kp.x - ball_x)**2 + (right_wrist_kp.y - ball_y)**2)
+                    dist = min(left_dist, right_dist)
                     
-                    # Validate coordinates are within frame boundaries
-                    if (0 <= left_wrist[0] < self.frame_width and 0 <= left_wrist[1] < self.frame_height and
-                        0 <= right_wrist[0] < self.frame_width and 0 <= right_wrist[1] < self.frame_height):
-                        
-                        have_valid_pose = True
-                        self.last_left_wrist = left_wrist
-                        self.last_right_wrist = right_wrist
-                        self.last_person_id = person_id
-                        self.frames_without_detection = 0
-                        
-                        # Draw detected wrists
-                        self._draw_wrist(frame, left_wrist, right_wrist, is_cached=False, person_id=person_id)
+                    if dist < min_distance:
+                        min_distance = dist
+                        closest_person = p
+                        person_id = i
+            
+            # Use the closest person if found
+            if closest_person is not None:
+                person = closest_person
+                print(f"Selected person {person_id} as closest to ball (distance: {min_distance:.1f}px)")
+            elif len(pose_detections) > 0:
+                # Fall back to highest confidence person
+                try:
+                    person = sorted(pose_detections, key=lambda x: getattr(x, 'confidence', 0), reverse=True)[0]
+                    person_id = pose_detections.index(person)
+                    print(f"Using highest confidence person {person_id} (no valid wrists found near ball)")
+                except Exception as e:
+                    logger.debug(f"Error sorting pose detections: {e}")
+                    person = pose_detections[0]
+                    person_id = 0
+            else:
+                return {'left_wrist': None, 'right_wrist': None, 'person_id': None}
+        else:
+            # Use highest confidence person when no ball position
+            if len(pose_detections) == 0:
+                return {'left_wrist': None, 'right_wrist': None, 'person_id': None}
+                
+            try:
+                person = sorted(pose_detections, key=lambda x: getattr(x, 'confidence', 0), reverse=True)[0]
+                person_id = pose_detections.index(person)
+            except Exception as e:
+                logger.debug(f"Error sorting pose detections: {e}")
+                person = pose_detections[0]
+                person_id = 0
+        
+        # Extract wrist keypoints from selected person
+        if person is not None and hasattr(person, 'keypoints') and len(person.keypoints) > max(self.LEFT_WRIST_IDX, self.RIGHT_WRIST_IDX):
+            left_wrist_kp = person.keypoints[self.LEFT_WRIST_IDX]
+            right_wrist_kp = person.keypoints[self.RIGHT_WRIST_IDX]
+            
+            # Check confidence and extract coordinates
+            if (left_wrist_kp.confidence > self.pose_confidence_threshold and 
+                right_wrist_kp.confidence > self.pose_confidence_threshold):
+                
+                left_wrist = np.array([left_wrist_kp.x, left_wrist_kp.y, left_wrist_kp.confidence])
+                right_wrist = np.array([right_wrist_kp.x, right_wrist_kp.y, right_wrist_kp.confidence])
+                
+                # Validate coordinates are within frame boundaries
+                if (0 <= left_wrist[0] < self.frame_width and 0 <= left_wrist[1] < self.frame_height and
+                    0 <= right_wrist[0] < self.frame_width and 0 <= right_wrist[1] < self.frame_height):
+                    
+                    have_valid_pose = True
+                    self.last_left_wrist = left_wrist
+                    self.last_right_wrist = right_wrist
+                    self.last_person_id = person_id
+                    self.frames_without_detection = 0
+                    
+                    # Draw detected wrists
+                    self._draw_wrist(frame, left_wrist, right_wrist, is_cached=False, person_id=person_id)
         
         # Use cached wrist positions if no valid pose detected
         if not have_valid_pose and self.last_left_wrist is not None and self.last_right_wrist is not None:
             if self.frames_without_detection < self.max_frames_to_keep:
                 left_wrist = self.last_left_wrist
                 right_wrist = self.last_right_wrist
+                person_id = self.last_person_id
                 self.frames_without_detection += 1
                 
                 # Draw cached wrists
@@ -417,6 +463,7 @@ class BallHoldingDetector:
                 # Reset wrist tracking after too many frames without detection
                 self.last_left_wrist = None
                 self.last_right_wrist = None
+                self.last_person_id = None
         
         return {'left_wrist': left_wrist, 'right_wrist': right_wrist, 'person_id': person_id}
     
@@ -657,6 +704,111 @@ class BallHoldingDetector:
                 print(f"\n*** BALL RELEASED! *** (Distance: {min_distance:.2f} > {self.hold_threshold})\n")
             self.hold_start_time = None
             self.is_holding = False
+            
+    def process_frame_with_tracks(self, frame, basketball_tracks):
+        """Process a frame with pre-detected basketball tracks
+        
+        Args:
+            frame: Input video frame
+            basketball_tracks: Dictionary of basketball tracks from the tracker
+            
+        Returns:
+            Tuple of (result_dict, annotated_frame)
+        """
+        try:
+            # Create a copy of the frame for annotation
+            annotated_frame = frame.copy()
+            ball_detected = False
+            ball_x_center = 0
+            ball_y_center = 0
+            ball_bbox = None
+            
+            # Process basketball tracks if available
+            if basketball_tracks:
+                # Check if basketball_tracks is a dictionary
+                if isinstance(basketball_tracks, dict):
+                    # Get the first track (or highest confidence track if available)
+                    track_id = list(basketball_tracks.keys())[0]
+                    track_data = basketball_tracks[track_id]
+                    
+                    # Extract ball position
+                    if 'center' in track_data:
+                        ball_detected = True
+                        ball_x_center, ball_y_center = track_data['center']
+                        ball_bbox = track_data.get('bbox', None)
+                elif isinstance(basketball_tracks, list) and len(basketball_tracks) > 0:
+                    # Handle list format
+                    track_data = basketball_tracks[0]
+                    if isinstance(track_data, dict) and 'center' in track_data:
+                        ball_detected = True
+                        ball_x_center, ball_y_center = track_data['center']
+                        ball_bbox = track_data.get('bbox', None)
+                elif isinstance(basketball_tracks, tuple) and len(basketball_tracks) > 0:
+                    # Handle tuple format
+                    track_data = basketball_tracks[0] if len(basketball_tracks) > 0 else None
+                    if track_data is not None:
+                        if isinstance(track_data, dict) and 'center' in track_data:
+                            ball_detected = True
+                            ball_x_center, ball_y_center = track_data['center']
+                            ball_bbox = track_data.get('bbox', None)
+                        elif isinstance(track_data, tuple) and len(track_data) >= 2:
+                            # Assume tuple is (x, y) coordinates
+                            ball_detected = True
+                            ball_x_center, ball_y_center = track_data[0], track_data[1]
+                            ball_bbox = None
+            
+            # Track poses
+            pose_result = self._track_poses(frame)
+            pose_detections = pose_result['detections']
+            annotated_frame = pose_result['frame']
+            
+            if ball_detected:
+                self.last_ball_pos = (ball_x_center, ball_y_center)
+                self.last_ball_bbox = ball_bbox
+                self.frames_without_detection = 0
+                
+                # Draw ball
+                self._draw_ball(annotated_frame, ball_x_center, ball_y_center, ball_bbox)
+            
+            # Use cached ball position if no detection
+            if not ball_detected and self.last_ball_pos is not None and self.frames_without_detection < self.max_frames_to_keep:
+                ball_detected = True
+                ball_x_center, ball_y_center = self.last_ball_pos
+                ball_bbox = self.last_ball_bbox
+                self.frames_without_detection += 1
+                
+                # Draw cached ball
+                self._draw_ball(annotated_frame, ball_x_center, ball_y_center, ball_bbox, is_cached=True)
+            
+            # Process wrists with ball position to find closest person
+            ball_position = (ball_x_center, ball_y_center) if ball_detected else None
+            wrist_result = self._process_wrists(pose_detections, annotated_frame, ball_position)
+            left_wrist = wrist_result['left_wrist']
+            right_wrist = wrist_result['right_wrist']
+            person_id = wrist_result['person_id']
+            
+            # Process holding detection
+            holding_detected = False
+            if ball_detected and left_wrist is not None and right_wrist is not None:
+                self._process_holding_detection(annotated_frame, ball_x_center, ball_y_center, left_wrist, right_wrist)
+                holding_detected = self.is_holding
+            else:
+                # Reset holding state if no ball or wrists detected
+                self.is_holding = False
+                self.hold_start_time = None
+            
+            # Return result
+            result = {
+                'holding_detected': holding_detected,
+                'ball_detected': ball_detected,
+                'person_id': person_id
+            }
+            
+            return result, annotated_frame
+            
+        except Exception as e:
+            logger.error(f"Error in holding detector with tracks: {e}")
+            return {'holding_detected': False, 'ball_detected': False, 'person_id': None}, frame.copy()
 
 
 if __name__ == "__main__":
