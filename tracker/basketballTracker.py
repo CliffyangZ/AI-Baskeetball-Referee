@@ -27,6 +27,7 @@ from tracker.utils.EnhancedKalmanFilter import EnhancedBasketballKalmanFilter
 from tracker.utils.openvino_utils import DeviceType, OpenVINOInferenceEngine
 from tracker.utils.byte_track import BasketballDetection
 from tracker.utils.algorithm import calculate_iou, hungarian_matching, greedy_matching, apply_nms
+from tracker.utils.byte_track import STrack
 
 class BasketballTracker:
     """
@@ -271,7 +272,7 @@ def main():
     """Demo the enhanced basketball tracker"""
     # Configuration
     model_path = "models/ov_models/basketballModel_openvino_model/basketballModel.xml"
-    video_path = "./data/ky.mov"
+    video_path = "./data/video/parallel_angle.mov"
     
     # Check if files exist
     if not Path(model_path).exists():
