@@ -1,11 +1,18 @@
 # Avi Shah - Basketball Shot Detector/Tracker - July 2023
 
+from pathlib import Path
+import sys
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from ultralytics import YOLO
 import cv2
 import cvzone
 import math
 import numpy as np
-from utils import score, detect_down, detect_up, in_hoop_region, clean_hoop_pos, clean_ball_pos, get_device
+from AI_referee.utils import score, detect_down, detect_up, in_hoop_region, clean_hoop_pos, clean_ball_pos, get_device
 
 class ShotDetector:
     def __init__(self, shared_basketball_tracker=None):

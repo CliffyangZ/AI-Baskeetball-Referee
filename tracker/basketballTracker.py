@@ -74,10 +74,10 @@ class BasketballTracker:
     def _get_default_config(self) -> dict:
         """Get default configuration"""
         return {
-            'detection': {'high_thresh': 0.8, 'low_thresh': 0.1, 'nms_thresh': 0.5},
+            'detection': {'high_thresh': 0.7, 'low_thresh': 0.4, 'nms_thresh': 0.5},
             'tracking': {'track_buffer': 30, 'match_thresh': 0.8},
-            'kalman': {'dt': 1.0, 'gravity': 2.0, 'max_occlusion_frames': 15},
-            'occlusion': {'max_prediction_frames': 15, 'confidence_decay': 0.95}
+            'kalman': {'dt': 0.053 , 'gravity': 2.73, 'max_occlusion_frames': 30},
+            'occlusion': {'max_prediction_frames': 30, 'confidence_decay': 0.97}
         }
 
     def detect_basketballs(self, frame: np.ndarray) -> List[BasketballDetection]:
@@ -272,7 +272,7 @@ def main():
     """Demo the enhanced basketball tracker"""
     # Configuration
     model_path = "models/ov_models/basketballModel_openvino_model/basketballModel.xml"
-    video_path = "./data/video/parallel_angle.mov"
+    video_path = "./data/video/dribbling.mov"
     
     # Check if files exist
     if not Path(model_path).exists():

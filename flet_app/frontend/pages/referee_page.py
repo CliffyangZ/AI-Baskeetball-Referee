@@ -238,10 +238,10 @@ class RefereePage(ft.Column):
             if not ret:
                 break
             
-            # Aggressive frame downscaling for performance
+            # Preserve higher resolution for clarity; only downscale if extremely large
             height, width = frame.shape[:2]
-            if width > 480:  # Even smaller resolution
-                scale = 480 / width
+            if width > 1280:  # Cap very large frames to 1280px width
+                scale = 1280 / width
                 new_width = int(width * scale)
                 new_height = int(height * scale)
                 frame = cv2.resize(frame, (new_width, new_height))
@@ -269,9 +269,9 @@ class RefereePage(ft.Column):
             
             skip_frames += 1
             
-            # Fast encoding with minimal quality
+            # High-quality encoding for clearer display
             frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 50]  # Lower quality
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]  # Higher quality for clarity
             _, buffer = cv2.imencode(".jpg", frame_rgb, encode_param)
             img_data = base64.b64encode(buffer).decode("utf-8")
             self.camera_feed.src_base64 = img_data
@@ -326,10 +326,10 @@ class RefereePage(ft.Column):
             self.page.update()
             return
         
-        # Set camera properties for better performance
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Lower resolution for better FPS
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 60)  # Higher capture FPS
+        # Set camera properties for better clarity (camera may adjust to closest supported mode)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_FPS, 60)  # Keep high capture FPS when supported
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to minimize latency
         
         # Start referee processing
