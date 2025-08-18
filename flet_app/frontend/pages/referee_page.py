@@ -14,6 +14,7 @@ from typing import Dict, Any
 import threading
 import time
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,15 @@ class RefereePage(ft.Column):
         self.cap = None
         self.referee_integration = RefereeIntegration()
         self.stats_update_task = None
+        
+        # Source selection: allow VIDEO_SOURCE env (index, file path, or URL)
+        self.env_video_source = os.environ.get("VIDEO_SOURCE", "0")
+        self._env_source_is_index = str(self.env_video_source).isdigit()
+        if self._env_source_is_index:
+            try:
+                self.selected_camera = int(self.env_video_source)
+            except Exception:
+                self.selected_camera = 0
         
         # Window settings
         page.window_frameless = False
@@ -67,13 +77,15 @@ class RefereePage(ft.Column):
         """Set up the user interface components"""
         
         # Camera dropdown
-        camera_options = self._get_available_cameras()
+        use_index_source = self._env_source_is_index
+        camera_options = self._get_available_cameras() if use_index_source else []
         self.camera_dropdown = ft.Dropdown(
             label="Select Camera",
             options=[ft.dropdown.Option(str(idx), f"Camera {idx}") for idx in camera_options],
-            value=str(camera_options[0]) if camera_options else None,
+            value=str(camera_options[0]) if (use_index_source and camera_options) else None,
             on_change=self._on_camera_change,
-            width=150
+            width=150,
+            disabled=not use_index_source
         )
         
         # Camera feed image
@@ -124,6 +136,12 @@ class RefereePage(ft.Column):
             border=ft.border.only(bottom=ft.border.BorderSide(1, "#BDBDBD"))
         )
         
+        # Source hint (visible when using non-index VIDEO_SOURCE)
+        source_hint = (
+            ft.Text(f"Using source: {self.env_video_source}", size=12, color="#757575")
+            if not use_index_source else ft.Container()
+        )
+        
         # Camera section (left side)
         camera_section = ft.Container(
             content=ft.Column([
@@ -139,6 +157,7 @@ class RefereePage(ft.Column):
                         self.start_btn,
                         self.stop_btn,
                         ft.Container(expand=1),  # Spacer
+                        source_hint,
                         ft.Text("Press SPACE to start/stop, ESC to exit", 
                                size=12, color="#757575")
                     ], spacing=10),
@@ -318,10 +337,11 @@ class RefereePage(ft.Column):
         if self.streaming:
             return
         
-        # Open camera
-        self.cap = cv2.VideoCapture(self.selected_camera)
+        # Open capture from env source (file/URL) or camera index
+        source = self.selected_camera if self._env_source_is_index else self.env_video_source
+        self.cap = cv2.VideoCapture(source)
         if not self.cap.isOpened():
-            self.status_text.value = "Error: Could not open camera"
+            self.status_text.value = f"Error: Could not open source: {source}"
             self.status_text.color = "#D32F2F"
             self.page.update()
             return

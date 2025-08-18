@@ -1,0 +1,28 @@
+# General
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.log
+.env
+.venv
+venv
+
+# Large/temporary
+**/.ipynb_checkpoints
+**/.mypy_cache
+**/.pytest_cache
+**/.ruff_cache
+**/.DS_Store
+
+# Data/models cache (keep models dir mountable)
+**/outputs
+**/runs
+**/checkpoints
+**/datasets
+**/videos
+**/tmp
